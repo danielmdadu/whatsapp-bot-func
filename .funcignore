@@ -1,0 +1,14 @@
+.git*
+.vscode
+__azurite_db*__.json
+__blobstorage__
+__queuestorage__
+local.settings.json
+test
+.venv
+.cursorignore
+test.http
+test_chatbot.py
+test_results/
+.env
+ARQUITECTURA_CHATBOT.md
