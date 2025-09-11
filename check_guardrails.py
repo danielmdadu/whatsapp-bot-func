@@ -4,6 +4,7 @@ from azure.ai.contentsafety import ContentSafetyClient
 from azure.ai.contentsafety.models import AnalyzeTextOptions
 from azure.core.credentials import AzureKeyCredential
 import requests
+import logging
 from check_conversation import clasificar_mensaje
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
@@ -148,8 +149,10 @@ class ContentSafetyGuardrails:
             print(f"Error en check_conversation_safety: {e}")
             return True  # En caso de error, considerar como no válido por seguridad
 
-    def check_message_safety(self, message: str):        
+    def check_message_safety(self, message: str):  
+        logging.info(f"Verificando seguridad del mensaje: {message}")      
         # Verificar inyección de código (no requiere API externa, es rápido)
+        logging.info(f"Verificando inyección de código: {self.detect_code_injection(message)}")
         if self.detect_code_injection(message):
             return {
                 "type": "code_injection",
@@ -158,6 +161,7 @@ class ContentSafetyGuardrails:
 
         try:
             # Verificar seguridad de contenido
+            logging.info(f"Verificando seguridad de contenido: {self.check_content_safety(message)}")
             content_safety_result = self.check_content_safety(message)
             if content_safety_result:
                 return {
@@ -166,6 +170,7 @@ class ContentSafetyGuardrails:
                 }
             
             # Verificar ataques de groundness
+            logging.info(f"Verificando ataques de groundness: {self.detect_groundness_result(message)}")
             groundness_result = self.detect_groundness_result(message)
             if groundness_result:
                 return {
@@ -174,6 +179,7 @@ class ContentSafetyGuardrails:
                 }
             
             # Verificar seguridad de conversación
+            logging.info(f"Verificando seguridad de conversación: {self.check_conversation_safety(message)}")
             conversation_safety_result = self.check_conversation_safety(message)
             if conversation_safety_result:
                 return {
@@ -184,6 +190,7 @@ class ContentSafetyGuardrails:
         except TimeoutError:
             # Si CUALQUIERA de las funciones dentro del 'try' lanza un TimeoutError,
             # este bloque lo capturará y devolverá el JSON correcto.
+            logging.info(f"Timeout del mensaje")
             return {
                 "type": "timeout",
                 "message": "MENSAJE INVÁLIDO: El análisis de seguridad excedió el tiempo límite. Por favor, intenta con un mensaje más simple."
