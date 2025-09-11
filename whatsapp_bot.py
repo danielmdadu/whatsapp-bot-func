@@ -8,7 +8,10 @@ import os
 import requests
 from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot
 from state_management import ConversationStateStore
-from typing import Optional
+from typing import Dict, Optional
+from datetime import datetime, timezone
+from hubspot_manager import HubSpotManager
+from check_guardrails import ContentSafetyGuardrails
 
 # ============================================================================
 # CLASE PRINCIPAL DEL BOT DE WHATSAPP
@@ -28,7 +31,15 @@ class WhatsAppBot:
         self.state_store = state_store
 
         # Una sola instancia del chatbot que manejará todos los usuarios
-        self.chatbot = IntelligentLeadQualificationChatbot(self.langchain_config, self.state_store)
+        # Pasar callback de envío de mensajes para que el chatbot pueda enviar directamente
+        self.chatbot = IntelligentLeadQualificationChatbot(
+            self.langchain_config, 
+            self.state_store,
+            send_message_callback=self.send_message
+        )
+
+        # Una sola instancia del guardrails
+        self.guardrails = ContentSafetyGuardrails()
         
     def _initialize_langchain_config(self):
         """Inicializa la configuración de LangChain con Azure OpenAI"""
@@ -70,7 +81,7 @@ class WhatsAppBot:
             },
         })
     
-    def send_message(self, wa_id: str, text: str) -> bool:
+    def send_message(self, wa_id: str, text: str) -> Optional[str]:
         """
         Envía un mensaje a través de WhatsApp API.
         """
@@ -84,42 +95,63 @@ class WhatsAppBot:
             url = f"https://graph.facebook.com/{self.version}/{self.phone_number_id}/messages"
             response = requests.post(url, data=data, headers=headers, timeout=10)
             response.raise_for_status()
+
+            json_response = response.json()
+            whatsapp_message_id = json_response["messages"][0]["id"]
             
-            # logging.info(f"Mensaje enviado exitosamente a {wa_id}")
-            return True
+            logging.info(f"Mensaje enviado exitosamente, response: {response.json()}")
+            # Mensaje enviado exitosamente, response: {'messaging_product': 'whatsapp', 'contacts': [{'input': '529931340372', 'wa_id': '5219931340372'}], 'messages': [{'id': 'wamid.HBgNNTIxOTkzMTM0MDM3MhUCABEYEjNDMUE3QkFFRjBGQjMxNzBGNQA='}]}
+            return whatsapp_message_id
             
         except Exception as e:
             logging.error(f"Error enviando mensaje a {wa_id}: {e}")
-            return False
+            return None
     
-    def process_message(self, wa_id: str, message_text: str) -> str:
+    def process_message(self, wa_id: str, message_text: str, whatsapp_message_id: str, hubspot_manager: HubSpotManager) -> None:
         """
-        Procesa un mensaje entrante y retorna la respuesta usando LangChain.
+        Procesa un mensaje entrante usando LangChain.
+        El chatbot ahora envía automáticamente las respuestas por WhatsApp.
         """
         try:
+            # Verificar si el mensaje es seguro
+            safety_result = self.guardrails.check_message_safety(message_text)
+            if safety_result:
+                response_for_lead = "No me queda claro lo que dices. ¿Podrías explicarme mejor?"
+                # Enviar respuesta de seguridad por WhatsApp
+                whatsapp_message_id_response = self.send_message(wa_id, response_for_lead)
+
+                # Ids de mensajes proporcionados por WhatsApp
+                whatsapp_ids = {
+                    "safety_message": whatsapp_message_id,
+                    "response_for_lead": whatsapp_message_id_response
+                }
+                # Guardar mensajes de seguridad en la base de datos
+                self._save_safety_messages(wa_id, safety_result["message"], response_for_lead, whatsapp_ids)
+                return
+
             # Verificar si es un comando especial
             if message_text.lower() == "reset":
-                return self._handle_reset_command(wa_id)
+                reset_response = self._handle_reset_command(wa_id, hubspot_manager)
+                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
+                self.send_message(wa_id, reset_response)
+                return
             elif message_text.lower() == "status":
-                return self._get_conversation_status(wa_id)
+                status_response = self._get_conversation_status(wa_id)
+                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
+                self.send_message(wa_id, status_response)
+                return
             
-            # Procesar mensaje con LangChain - ahora pasamos el user_id
-            response = self.chatbot.send_message(message_text, user_id=wa_id)
-
-            # Verificar si la conversación está completa
-            self.chatbot.load_conversation(wa_id)  # Cargar para verificar estado
-            if self.chatbot.state["completed"]:
-                logging.info(f"Conversación completada para usuario {wa_id}")
-                # TODO: aquí podrías sincronizar con HubSpot si es necesario
+            # Procesar mensaje con LangChain (ahora envía automáticamente por WhatsApp)
+            self.chatbot.send_message(message_text, whatsapp_message_id, hubspot_manager)
                 
-            return response
-            
         except Exception as e:
             logging.error(f"Error procesando mensaje: {e}")
-            return "Disculpa, hubo un problema técnico. ¿Podrías repetir tu mensaje?"
+            error_message = "Disculpa, hubo un problema técnico. ¿Podrías repetir tu mensaje?"
+            self.send_message(wa_id, error_message)
     
-    def _handle_reset_command(self, wa_id: str) -> str:
+    def _handle_reset_command(self, wa_id: str, hubspot_manager: HubSpotManager) -> str:
         """Maneja el comando de reset"""
+        hubspot_manager.delete_contact()
         self.chatbot.load_conversation(wa_id)
         self.chatbot.reset_conversation()
         logging.info(f"Conversación reiniciada para usuario {wa_id}")
@@ -130,15 +162,47 @@ class WhatsAppBot:
         Verifica si el usuario está autorizado para usar el bot.
         """
         authorized_ids = [
-            os.environ['RECIPIENT_WAID']
+            os.environ['RECIPIENT_WAID'],
         ]
+        if os.environ['RECIPIENT_WAID_2']:
+            authorized_ids.append(os.environ['RECIPIENT_WAID_2'])
+        if os.environ['RECIPIENT_WAID_3']:
+            authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
+            
         return wa_id in authorized_ids
     
-    def get_conversation_summary(self, wa_id: str) -> dict:
-        """Obtiene un resumen de la conversación actual del usuario."""
-        self.chatbot.load_conversation(wa_id)
-        return self.chatbot.get_conversation_summary()
-    
+    def _save_safety_messages(self, wa_id: str, safety_message: str, response_for_lead: str, whatsapp_ids: Dict[str, str]) -> None:
+        """
+        Guarda los mensajes de seguridad en la base de datos usando _append_messages.
+        Guarda el mensaje de seguridad del bot y la respuesta genérica.
+        """
+        try:
+            # Asegurar que el usuario tenga una conversación cargada
+            self.chatbot.save_conversation()
+
+            # Preparar los dos mensajes a guardar
+            safety_messages = [
+                {
+                    "content": safety_message,
+                    "role": "user",
+                    "whatsapp_message_id": whatsapp_ids["safety_message"],
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # Se generará automáticamente en _append_messages
+                },
+                {
+                    "content": response_for_lead,
+                    "role": "bot",
+                    "whatsapp_message_id": whatsapp_ids["response_for_lead"],
+                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # Se generará automáticamente en _append_messages
+                }
+            ]
+            
+            # Usar _append_messages para guardar los mensajes
+            self.state_store._append_messages(wa_id, safety_messages)
+            logging.info(f"Mensajes de seguridad guardados para usuario {wa_id}")
+            
+        except Exception as e:
+            logging.error(f"Error guardando mensajes de seguridad para usuario {wa_id}: {e}")
+
     def _get_conversation_status(self, wa_id: str) -> str:
         """Obtiene el estado actual de la conversación del usuario."""
         try:
@@ -149,23 +213,19 @@ class WhatsAppBot:
         👤 Usuario: {wa_id}
         ✅ Completada: {'Sí' if state.get('completed', False) else 'No'}
         📝 Nombre: {state.get('nombre', 'No especificado')}
+        👤 Apellido: {state.get('apellido', 'No especificado')}
         🔧 Tipo maquinaria: {state.get('tipo_maquinaria', 'No especificado')}
+        🔍 Detalles maquinaria: {state.get('detalles_maquinaria', 'No especificado')}
+        💼 Nombre empresa: {state.get('nombre_empresa', 'No especificado')}
+        💼 Giro empresa: {state.get('giro_empresa', 'No especificado')}
         🌐 Sitio web: {state.get('sitio_web', 'No especificado')}
-        💼 Uso: {state.get('uso_empresa_o_venta', 'No especificado')}
+        💼 Tipo de uso: {state.get('uso_empresa_o_venta', 'No especificado')}
         📧 Correo: {state.get('correo', 'No especificado')}
         📱 Teléfono: {state.get('telefono', 'No especificado')}
-        💬 Total mensajes: {len(state.get('messages', []))}"""
+        📍 Lugar requerimiento: {state.get('lugar_requerimiento', 'No especificado')}
+        💬 Total mensajes: {len(state.get('messages', []))}
+        👤 Conversación mode: {state.get('conversation_mode', 'No especificado')}
+        """
         except Exception as e:
             logging.error(f"Error obteniendo estado de conversación: {e}")
             return f"❌ Error obteniendo estado: {str(e)}"
-    
-# ============================================================================
-# COMANDOS DISPONIBLES PARA EL USUARIO
-# ============================================================================
-# 
-# Comandos especiales que puedes enviar por WhatsApp:
-# 
-# 🔄 "reset" - Reinicia la conversación actual
-# 📊 "status" - Muestra el estado actual de la conversación
-# 
-# ============================================================================

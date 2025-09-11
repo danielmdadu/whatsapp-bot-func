@@ -12,6 +12,11 @@ from whatsapp_bot import WhatsAppBot
 from state_management import InMemoryStateStore, CosmosDBStateStore
 from azure.cosmos import CosmosClient
 from datetime import datetime, timezone, timedelta
+from hubspot_manager import HubSpotManager
+
+# Silencia solo los logs detallados del SDK de Azure Cosmos y del pipeline HTTP
+logging.getLogger("azure.cosmos").setLevel(logging.ERROR)
+logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.ERROR)
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -34,16 +39,8 @@ def verify(req):
     Handles WhatsApp webhook verification (GET requests).
     This is called when you first set up the webhook in Meta Developer Console.
     """
-    # logging.info("verify - Start")
 
     verify_token = os.environ["VERIFY_TOKEN"]
-    # if verify_token:
-    #     logging.info(f"verify_token: {verify_token}")
-    # else:
-    #     logging.info("VERIFY_TOKEN Empty")
-
-    # if req.params:
-    #     logging.info(req.params)
 
     # Parse params from the webhook verification request
     mode = req.params.get("hub.mode")
@@ -115,7 +112,7 @@ def handle_message(req):
     """
 
     body = req.get_json()
-    # logging.info(f"request body: {body}")
+    logging.info(f"request body: {body}")
 
     # Check if it's a WhatsApp status update (ignore these)
     if (
@@ -133,7 +130,6 @@ def handle_message(req):
             whatsapp_bot = create_whatsapp_bot()
             process_whatsapp_message(body, whatsapp_bot)
 
-            # logging.info(f"Webhook body completo: {json.dumps(body, indent=2)}")
             return func.HttpResponse("OK", status_code=200)
         else:
             # if the request is not a WhatsApp API event, return an error
@@ -176,45 +172,51 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
 
     # Extract message content
     message = body["entry"][0]["changes"][0]["value"]["messages"][0]
+    phone_number = message["from"] # Número de WhatsApp del lead empezando por 521
     logging.info(f"message: {message}")
 
     if "text" in message:
-        # Handle text messages with AI conversation manager
-        # logging.info(f"Message Type: TEXT")
+        # Extraer el contenido en texto del mensaje
         message_body = message["text"]["body"]
-        # logging.info(f"message_body: {message_body}")
+        # Extraer el id del mensaje asignado por WhatsApp
+        whatsapp_message_id = message["id"]
+
+        # Cargar conversación
+        whatsapp_bot.chatbot.load_conversation(wa_id)
+
+        # Verificar que en los ids de los últimos 3 mensajes no esté el id del mensaje actual
+        # Esto es para evitar procesar mensajes duplicados
+        # En algunas ocasiones, WhatsApp envía mensajes duplicados (parece que cuando un guardrail se tarda en procesar, envía el mismo mensaje duplicado)
+        last_3_messages = whatsapp_bot.chatbot.state.get("messages", [])[-3:]
+        if whatsapp_message_id in [msg.get("whatsapp_message_id") for msg in last_3_messages]:
+            logging.info(f"Mensaje duplicado detectado: {whatsapp_message_id}")
+            return
+
+        # Crear instancia de HubSpotManager
+        hubspot_manager = HubSpotManager(os.environ["HUBSPOT_ACCESS_TOKEN"])
+
+        # Actualizar número de WhatsApp en estado si no se ha guardado
+        # Esto solo se ejecuta cuando se inicia una conversación
+        current_state = whatsapp_bot.chatbot.state
+        if not current_state.get("telefono"):
+            # Normalizar número de WhatsApp
+            phone_number = whatsapp_bot.normalize_mexican_number(phone_number)
+            current_state["telefono"] = phone_number
+            current_state["hubspot_contact_id"] = hubspot_manager.create_contact(wa_id, phone_number)
+        else:
+            hubspot_manager.contact_id = current_state["hubspot_contact_id"]
         
         # Verificar timeout de agente antes de procesar
         timeout_occurred = check_agent_timeout(wa_id, whatsapp_bot)
         if timeout_occurred:
             logging.info(f"Timeout de agente detectado para {wa_id}, regresando a modo bot")
-        
-        # Cargar estado actual para verificar modo
-        whatsapp_bot.chatbot.load_conversation(wa_id)
-        current_mode = whatsapp_bot.chatbot.state.get("conversation_mode", "bot")
-        
-        if current_mode == "agente":
-            # Modo agente: solo ejecutar slot-filling, NO enviar respuesta automática
-            logging.info(f"Modo agente activo para {wa_id}, solo ejecutando slot-filling")
-            try:
-                # Ejecutar slot-filling usando el contexto del último mensaje (agente o bot)
-                whatsapp_bot.chatbot.send_message(message_body, user_id=wa_id)
-                # Nota: send_message ejecuta slot-filling pero en modo agente no genera respuesta automática
-                logging.info(f"Slot-filling ejecutado para mensaje en modo agente: {wa_id}")
-            except Exception as e:
-                logging.error(f"Error ejecutando slot-filling en modo agente: {e}")
-        else:
-            # Modo bot: procesar normalmente con respuesta automática
-            logging.info(f"Modo bot activo para {wa_id}, procesando normalmente")
-            try:
-                response = whatsapp_bot.process_message(wa_id, message_body)
-                whatsapp_bot.send_message(wa_id, response)
-            except Exception as e:
-                logging.error(f"Error processing message: {e}")
-                error_message = "Disculpa, hubo un problema técnico. ¿Podrías repetir tu mensaje?"
-                whatsapp_bot.send_message(wa_id, error_message)
+
+        # Ejecutar slot-filling usando el contexto del último mensaje (agente o bot)
+        # Ahora el chatbot envía automáticamente las respuestas por WhatsApp
+        whatsapp_bot.process_message(wa_id, message_body, whatsapp_message_id, hubspot_manager)
         
     else:
+        # TODO: Esto se debería registrar en Cosmos DB
         # Handle non-text messages with a help message
         logging.info(f"Message Type: NON-TEXT")
         help_text = "¡Hola! Solo puedo procesar mensajes de texto. Por favor, envíame un mensaje de texto y te responderé con información sobre maquinaria."
@@ -224,7 +226,9 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
 def agent_message(req: func.HttpRequest) -> func.HttpResponse:
     """
     Endpoint para recibir mensajes del agente humano.
-    Procesa el mensaje, ejecuta slot-filling y envía al lead vía WhatsApp.
+    Procesa el mensaje y envía al lead vía WhatsApp.
+    No ejecuta slot-filling ni guarda el estado ni mensaje en Cosmos DB.
+    El mensaje ya se guardó en Cosmos DB por la otra funcion.
     """
     logging.info('Endpoint agent-message activado')
     
@@ -245,65 +249,21 @@ def agent_message(req: func.HttpRequest) -> func.HttpResponse:
         if not wa_id or not message:
             return func.HttpResponse("Missing wa_id or message", status_code=400)
         
-        # Crear instancia del bot
+        # Crear instancia de WhatsAppBot
         whatsapp_bot = create_whatsapp_bot()
         
-        # Procesar mensaje del agente
-        success = process_agent_message(wa_id, message, whatsapp_bot)
-        
-        if success:
-            return func.HttpResponse("Agent message processed successfully", status_code=200)
+        # Enviar mensaje al lead vía WhatsApp
+        whatsapp_message_id = whatsapp_bot.send_message(wa_id, message)
+
+        if whatsapp_message_id:
+            # Regresar el ID de WhatsApp del mensaje
+            return func.HttpResponse(whatsapp_message_id, status_code=200)
         else:
-            return func.HttpResponse("Error processing agent message", status_code=500)
+            return func.HttpResponse("Error sending agent message", status_code=500)
             
     except Exception as e:
         logging.error(f"Error en endpoint agent-message: {e}")
         return func.HttpResponse("Internal server error", status_code=500)
-
-def process_agent_message(wa_id: str, message: str, whatsapp_bot: WhatsAppBot) -> bool:
-    """
-    Procesa un mensaje del agente humano.
-    1. Cambia el modo de conversación a 'agente' si no estaba ya
-    2. Agrega el mensaje del agente al historial
-    3. Envía el mensaje al lead vía WhatsApp
-    4. NO ejecuta slot-filling en mensajes del agente
-    """
-    try:
-        logging.info(f"Procesando mensaje de agente para wa_id: {wa_id}")
-        
-        # Cargar conversación actual
-        whatsapp_bot.chatbot.load_conversation(wa_id)
-        current_state = whatsapp_bot.chatbot.state
-        
-        # Cambiar a modo agente si no estaba ya
-        if current_state.get("conversation_mode") != "agente":
-            current_state["conversation_mode"] = "agente"
-            logging.info(f"Modo cambiado a 'agente' para usuario {wa_id}")
-        
-        # Agregar mensaje del agente al historial
-        current_state["messages"].append({
-            "role": "assistant",
-            "content": message,
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sender": "agente"
-        })
-        
-        # Guardar estado actualizado
-        whatsapp_bot.chatbot.save_conversation()
-        
-        # Enviar mensaje al lead vía WhatsApp
-        success = whatsapp_bot.send_message(wa_id, message)
-        
-        if success:
-            logging.info(f"Mensaje de agente enviado exitosamente a {wa_id}")
-        else:
-            logging.error(f"Error enviando mensaje de agente a {wa_id}")
-        
-        return success
-        
-    except Exception as e:
-        logging.error(f"Error procesando mensaje de agente: {e}")
-        return False
 
 def check_agent_timeout(wa_id: str, whatsapp_bot: WhatsAppBot) -> bool:
     """
@@ -312,8 +272,6 @@ def check_agent_timeout(wa_id: str, whatsapp_bot: WhatsAppBot) -> bool:
     Retorna True si se cambió el modo, False si no.
     """
     try:
-        # Cargar conversación
-        whatsapp_bot.chatbot.load_conversation(wa_id)
         current_state = whatsapp_bot.chatbot.state
         
         # Solo verificar si está en modo agente

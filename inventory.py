@@ -6,7 +6,6 @@ from typing import List
 import logging
 from dataclasses import dataclass
 
-
 @dataclass
 class InventoryItem:
     tipo_maquina: str

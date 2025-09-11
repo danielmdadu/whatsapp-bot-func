@@ -19,3 +19,7 @@ pydantic
 
 # Cosmos DB
 azure-cosmos
+
+# Azure Content Safety
+azure-ai-contentsafety
+azure-ai-inference

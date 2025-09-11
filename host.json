@@ -8,8 +8,9 @@
       }
     },
     "logLevel": {
-      "Function.whatsappbot1.User": "Information",
-      "Function": "Error"
+      "default": "Information",  
+      "azure.cosmos": "Error",    
+      "azure.core": "Warning"
     }
   },
   "extensionBundle": {

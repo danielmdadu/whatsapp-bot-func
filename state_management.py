@@ -5,21 +5,24 @@ from datetime import datetime, timezone
 import logging
 
 class MaquinariaType(str, Enum):
-    SOLDADORAS = "soldadoras"
+    SOLDADORAS = "soldadora"
     COMPRESOR = "compresor"
     TORRE_ILUMINACION = "torre_iluminacion"
-    LGMG = "lgmg"
-    GENERADORES = "generadores"
-    ROMPEDORES = "rompedores"
+    PLATAFORMA = "plataforma"
+    GENERADORES = "generador"
+    ROMPEDORES = "rompedor"
+    APISONADOR = "apisonador"
+    MONTACARGAS = "montacargas"
+    MANIPULADOR = "manipulador"
 
 class ConversationState(TypedDict):
     messages: List[Dict[str, Any]]  # Cambiado para soportar campos adicionales
     nombre: Optional[str]
+    apellido: Optional[str]
     tipo_maquinaria: Optional[MaquinariaType]
     detalles_maquinaria: Dict[str, Any]
     sitio_web: Optional[str]
     uso_empresa_o_venta: Optional[str]
-    nombre_completo: Optional[str]
     nombre_empresa: Optional[str]
     giro_empresa: Optional[str]
     correo: Optional[str]
@@ -29,6 +32,8 @@ class ConversationState(TypedDict):
     lugar_requerimiento: Optional[str]
     conversation_mode: str  # "bot" | "agente"
     asignado_asesor: Optional[str]
+    # ID del contacto en HubSpot
+    hubspot_contact_id: Optional[str]
 
 class ConversationStateStore(ABC):
     """Interfaz para almacenar y recuperar estados de conversación"""
@@ -153,6 +158,7 @@ class CosmosDBStateStore(ConversationStateStore):
         for msg in state["messages"]:
             msg_formatted = {
                 "id": f"msg_{len(messages_formatted)+1}",
+                "whatsapp_message_id": msg.get("whatsapp_message_id", ""),
                 "sender": msg.get("sender", "lead" if msg["role"] == "user" else "bot"),
                 "text": msg["content"],
                 "timestamp": msg.get("timestamp", now),
@@ -166,6 +172,7 @@ class CosmosDBStateStore(ConversationStateStore):
         state_copy.pop("messages", None)
         state_copy.pop("conversation_mode", None)
         state_copy.pop("asignado_asesor", None)
+        state_copy.pop("hubspot_contact_id", None)
         
         # Convertir MaquinariaType a string para JSON
         if state_copy.get("tipo_maquinaria"):
@@ -180,7 +187,8 @@ class CosmosDBStateStore(ConversationStateStore):
             "state": state_copy,
             "messages": messages_formatted,
             "conversation_mode": state.get("conversation_mode", "bot"),
-            "asignado_asesor": state.get("asignado_asesor")
+            "asignado_asesor": state.get("asignado_asesor"),
+            "hubspot_contact_id": state.get("hubspot_contact_id")
         }
         
         return cosmos_doc
@@ -211,11 +219,11 @@ class CosmosDBStateStore(ConversationStateStore):
         conversation_state: ConversationState = {
             "messages": messages,
             "nombre": state.get("nombre"),
+            "apellido": state.get("apellido"),
             "tipo_maquinaria": state.get("tipo_maquinaria"),
             "detalles_maquinaria": state.get("detalles_maquinaria", {}),
             "sitio_web": state.get("sitio_web"),
             "uso_empresa_o_venta": state.get("uso_empresa_o_venta"),
-            "nombre_completo": state.get("nombre_completo"),
             "nombre_empresa": state.get("nombre_empresa"),
             "giro_empresa": state.get("giro_empresa"),
             "correo": state.get("correo"),
@@ -223,7 +231,8 @@ class CosmosDBStateStore(ConversationStateStore):
             "completed": state.get("completed", False),
             "lugar_requerimiento": state.get("lugar_requerimiento"),
             "conversation_mode": cosmos_doc.get("conversation_mode", "bot"),
-            "asignado_asesor": cosmos_doc.get("asignado_asesor")
+            "asignado_asesor": cosmos_doc.get("asignado_asesor"),
+            "hubspot_contact_id": cosmos_doc.get("hubspot_contact_id")
         }
         
         return conversation_state
@@ -250,8 +259,8 @@ class CosmosDBStateStore(ConversationStateStore):
         
         # Campos a monitorear para cambios
         fields_to_check = [
-            "nombre", "tipo_maquinaria", "detalles_maquinaria", "sitio_web",
-            "uso_empresa_o_venta", "nombre_completo", "nombre_empresa", 
+            "nombre", "apellido", "tipo_maquinaria", "detalles_maquinaria", "sitio_web",
+            "uso_empresa_o_venta", "nombre_empresa", 
             "giro_empresa", "correo", "telefono", "completed", 
             "lugar_requerimiento", "asignado_asesor"
         ]
@@ -278,6 +287,7 @@ class CosmosDBStateStore(ConversationStateStore):
             for i, msg in enumerate(new_messages):
                 msg_formatted = {
                     "id": f"msg_{int(datetime.now(timezone.utc).timestamp())}_{i}",
+                    "whatsapp_message_id": msg.get("whatsapp_message_id", ""),
                     "sender": msg.get("sender", "lead" if msg["role"] == "user" else "bot"),
                     "text": msg["content"],
                     "timestamp": msg.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
