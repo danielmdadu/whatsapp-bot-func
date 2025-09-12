@@ -26,11 +26,39 @@ def whatsappbot1(req: func.HttpRequest) -> func.HttpResponse:
     Main Azure Function entry point for WhatsApp webhook.
     Handles both GET (verification) and POST (message) requests.
     """
-    # logging.info('Python HTTP trigger function processed a request')
-    # logging.info(f"req.method: {req.method}")
+    logging.info('NUEVA HTTP REQUEST: whatsappbot1')
+    logging.info(f"req.method: {req.method}")
 
     if req.method == 'POST':
-        return handle_message(req)
+        # return handle_message(req)
+        body = req.get_json()
+        logging.info(f"TESTING: request body: {body}")
+        if is_valid_whatsapp_message(body):
+            # Extract sender information
+            wa_id = body["entry"][0]["changes"][0]["value"]["contacts"][0]["wa_id"]
+            logging.info(f"TESTING: wa_id: {wa_id}")
+            # Extract message content
+            message = body["entry"][0]["changes"][0]["value"]["messages"][0]["text"]["body"]
+            logging.info(f"TESTING: Mensaje recibido: {message}")
+            try:
+                message = "Mandaste el mensaje: " + message
+                data = WhatsAppBot().get_text_message_input(wa_id, message)
+                headers = {
+                    "Content-type": "application/json",
+                    "Authorization": "Bearer " + os.environ['WHATSAPP_ACCESS_TOKEN'],
+                }
+                
+                url = "https://graph.facebook.com/" + os.environ['WHATSAPP_API_VERSION'] + "/" + os.environ['PHONE_NUMBER_ID'] + "/messages"
+                import requests
+                response = requests.post(url, data=data, headers=headers, timeout=10)
+                logging.info(f"TESTING: response: {response.json()}")
+            except Exception as e:
+                logging.error(f"TESTING: Error sending message: {e}")
+                return func.HttpResponse("Error sending message", status_code=500)
+            return func.HttpResponse("OK", status_code=200)
+        else:
+            logging.info("TESTING: Received a WhatsApp status update.")
+            return func.HttpResponse("OK", status_code=200)
     else:
         return verify(req)
 
