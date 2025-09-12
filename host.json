@@ -6,11 +6,6 @@
         "isEnabled": true,
         "excludedTypes": "Request"
       }
-    },
-    "logLevel": {
-      "default": "Information",  
-      "azure.cosmos": "Error",    
-      "azure.core": "Warning"
     }
   },
   "extensionBundle": {

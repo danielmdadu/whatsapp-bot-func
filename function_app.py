@@ -14,10 +14,6 @@ from azure.cosmos import CosmosClient
 from datetime import datetime, timezone, timedelta
 from hubspot_manager import HubSpotManager
 
-# Silencia solo los logs detallados del SDK de Azure Cosmos y del pipeline HTTP
-logging.getLogger("azure.cosmos").setLevel(logging.ERROR)
-logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.ERROR)
-
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
 @app.route(route="whatsappbot1")
