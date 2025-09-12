@@ -28,7 +28,7 @@ def debug_print(*args, **kwargs):
     Función helper para imprimir mensajes de DEBUG solo cuando DEBUG_MODE es True
     """
     if DEBUG_MODE:
-        print(*args, **kwargs)
+        logging.info(*args, **kwargs)
 
 # ============================================================================
 # SISTEMA DE FRASES ALEATORIAS
@@ -319,7 +319,7 @@ class IntelligentSlotFiller:
             return result
             
         except Exception as e:
-            print(f"Error extrayendo información: {e}")
+            logging.error(f"Error extrayendo información: {e}")
             return {}
     
     def get_next_question(self, current_state: ConversationState) -> Optional[str]:
@@ -369,7 +369,7 @@ class IntelligentSlotFiller:
             return None
             
         except Exception as e:
-            print(f"Error generando siguiente pregunta: {e}")
+            logging.error(f"Error generando siguiente pregunta: {e}")
             return None
     
     def _get_maquinaria_detail_question_with_reason(self, current_state: ConversationState) -> Optional[dict]:
@@ -572,7 +572,7 @@ class IntelligentResponseGenerator:
             return result
             
         except Exception as e:
-            print(f"Error generando respuesta conversacional: {e}")
+            logging.error(f"Error generando respuesta conversacional: {e}")
             # Fallback a la lógica simple si no se puede generar la respuesta
             if next_question and next_question_reason:
                 return next_question + " " + next_question_reason
@@ -667,7 +667,7 @@ class InventoryResponder:
             return result == "true"
             
         except Exception as e:
-            print(f"Error detectando pregunta de inventario: {e}")
+            logging.error(f"Error detectando pregunta de inventario: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -840,7 +840,7 @@ class IntelligentLeadQualificationChatbot:
             return self._add_message_and_return_response(contextual_response)
         
         except Exception as e:
-            print(f"Error procesando mensaje: {e}")
+            logging.error(f"Error procesando mensaje: {e}")
             return "Disculpe, hubo un error técnico. ¿Podría intentar de nuevo?"
         
     def _add_message_and_return_response(self, response: str) -> str:
@@ -905,7 +905,7 @@ class IntelligentLeadQualificationChatbot:
                     debug_print(f"DEBUG: Campo '{key}' actualizado a (Enum): {self.state[key]}")
                 except ValueError:
                     # Si el LLM extrae un tipo inválido, lo registramos pero no detenemos el flujo.
-                    print(f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM.")
+                    logging.error(f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM.")
             
             elif key == "apellido":
                 # Combinar nombre y apellido en el campo nombre
