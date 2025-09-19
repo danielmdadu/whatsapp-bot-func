@@ -157,71 +157,81 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
     Processes the WhatsApp message and sends appropriate response.
     Uses the conversation manager and WhatsApp bot for intelligent responses.
     """
+    try:
+        message_info = body["entry"][0]["changes"][0]["value"]
 
-    message_info = body["entry"][0]["changes"][0]["value"]
+        # Extraer el wa_id del lead
+        wa_id = message_info["contacts"][0]["wa_id"]
+        logging.info(f"wa_id del lead: {wa_id}")
 
-    # Extraer el wa_id del lead
-    wa_id = message_info["contacts"][0]["wa_id"]
-    logging.info(f"wa_id del lead: {wa_id}")
-
-    # Verificar que quien manda el mensaje esté autorizado
-    # TODO: Eliminar en producción
-    if not whatsapp_bot.is_authorized_user(wa_id):
-        logging.info(f"wa_id no autorizado: {wa_id}")
-        logging.error("Unauthorized user!!!")
-        return
-
-    # Extraer el contenido del mensaje
-    message_details = message_info["messages"][0]
-    logging.info(f"Detalles del mensaje: {message_details}")
-    phone_number = message_details["from"] # Número de WhatsApp del lead empezando por 521
-
-    if "text" in message_details:
-        # Extraer el contenido en texto del mensaje
-        message_text = message_details["text"]["body"]
-        # Extraer el id del mensaje asignado por WhatsApp
-        whatsapp_message_id = message_details["id"]
-
-        # Cargar conversación
-        whatsapp_bot.chatbot.load_conversation(wa_id)
-
-        # Verificar que en los ids de los últimos 3 mensajes no esté el id del mensaje actual
-        # Esto es para evitar procesar mensajes duplicados
-        # En algunas ocasiones, WhatsApp envía mensajes duplicados (parece que cuando un guardrail se tarda en procesar, envía el mismo mensaje duplicado)
-        last_3_messages = whatsapp_bot.chatbot.state.get("messages", [])[-3:]
-        if whatsapp_message_id in [msg.get("whatsapp_message_id") for msg in last_3_messages]:
-            logging.info(f"Mensaje duplicado detectado: {whatsapp_message_id}")
+        # Verificar que quien manda el mensaje esté autorizado
+        # TODO: Eliminar en producción
+        if not whatsapp_bot.is_authorized_user(wa_id):
+            logging.info(f"wa_id no autorizado: {wa_id}")
+            logging.error("Unauthorized user!!!")
             return
 
-        # Crear instancia de HubSpotManager
-        hubspot_manager = HubSpotManager(os.environ["HUBSPOT_ACCESS_TOKEN"])
+        # Extraer el contenido del mensaje
+        message_details = message_info["messages"][0]
+        logging.info(f"Detalles del mensaje: {message_details}")
+        phone_number = message_details["from"] # Número de WhatsApp del lead empezando por 521
 
-        # Actualizar número de WhatsApp en estado si no se ha guardado
-        # Esto solo se ejecuta cuando se inicia una conversación
-        current_state = whatsapp_bot.chatbot.state
-        if not current_state.get("telefono"):
-            # Normalizar número de WhatsApp
-            phone_number = whatsapp_bot.normalize_mexican_number(phone_number)
-            current_state["telefono"] = phone_number
-            current_state["hubspot_contact_id"] = hubspot_manager.create_contact(wa_id, phone_number)
+        if "text" in message_details:
+            # Extraer el contenido en texto del mensaje
+            message_text = message_details["text"]["body"]
+            # Extraer el id del mensaje asignado por WhatsApp
+            whatsapp_message_id = message_details["id"]
+
+            # Cargar conversación
+            whatsapp_bot.chatbot.load_conversation(wa_id)
+
+            logging.info(f"Conversación cargada para usuario {wa_id}")
+
+            # Verificar que en los ids de los últimos 3 mensajes no esté el id del mensaje actual
+            # Esto es para evitar procesar mensajes duplicados
+            # En algunas ocasiones, WhatsApp envía mensajes duplicados (parece que cuando un guardrail se tarda en procesar, envía el mismo mensaje duplicado)
+            last_3_messages = whatsapp_bot.chatbot.state.get("messages", [])[-3:]
+            if whatsapp_message_id in [msg.get("whatsapp_message_id") for msg in last_3_messages]:
+                logging.info(f"Mensaje duplicado detectado: {whatsapp_message_id}")
+                return
+
+            logging.info(f"Mensaje duplicado no detectado: {whatsapp_message_id}")
+
+            # Crear instancia de HubSpotManager
+            hubspot_manager = HubSpotManager(os.environ["HUBSPOT_ACCESS_TOKEN"])
+
+            logging.info(f"HubSpotManager creado para usuario {wa_id}")
+
+            # Actualizar número de WhatsApp en estado si no se ha guardado
+            # Esto solo se ejecuta cuando se inicia una conversación
+            current_state = whatsapp_bot.chatbot.state
+            if not current_state.get("telefono"):
+                # Normalizar número de WhatsApp
+                phone_number = whatsapp_bot.normalize_mexican_number(phone_number)
+                current_state["telefono"] = phone_number
+                current_state["hubspot_contact_id"] = hubspot_manager.create_contact(wa_id, phone_number)
+            else:
+                hubspot_manager.contact_id = current_state["hubspot_contact_id"]
+            
+            # Verificar timeout de agente antes de procesar
+            timeout_occurred = check_agent_timeout(wa_id, whatsapp_bot)
+            if timeout_occurred:
+                logging.info(f"Timeout de agente detectado para {wa_id}, regresando a modo bot")
+
+            # Ejecutar slot-filling usando el contexto del último mensaje (agente o bot)
+            # Ahora el chatbot envía automáticamente las respuestas por WhatsApp
+            whatsapp_bot.process_message(wa_id, message_text, whatsapp_message_id, hubspot_manager)
+            
         else:
-            hubspot_manager.contact_id = current_state["hubspot_contact_id"]
-        
-        # Verificar timeout de agente antes de procesar
-        timeout_occurred = check_agent_timeout(wa_id, whatsapp_bot)
-        if timeout_occurred:
-            logging.info(f"Timeout de agente detectado para {wa_id}, regresando a modo bot")
+            # TODO: Esto se debería registrar en Cosmos DB
+            # Handle non-text messages with a help message
+            logging.info(f"Message Type: NON-TEXT")
+            help_text = "¡Hola! Solo puedo procesar mensajes de texto. Por favor, envíame un mensaje de texto y te responderé con información sobre maquinaria."
+            whatsapp_bot.send_message(wa_id, help_text)
 
-        # Ejecutar slot-filling usando el contexto del último mensaje (agente o bot)
-        # Ahora el chatbot envía automáticamente las respuestas por WhatsApp
-        whatsapp_bot.process_message(wa_id, message_text, whatsapp_message_id, hubspot_manager)
-        
-    else:
-        # TODO: Esto se debería registrar en Cosmos DB
-        # Handle non-text messages with a help message
-        logging.info(f"Message Type: NON-TEXT")
-        help_text = "¡Hola! Solo puedo procesar mensajes de texto. Por favor, envíame un mensaje de texto y te responderé con información sobre maquinaria."
-        whatsapp_bot.send_message(wa_id, help_text)
+    except Exception as e:
+        logging.error(f"Error procesando mensaje: {e}")
+        return func.HttpResponse("Internal server error", status_code=500)
 
 @app.route(route="agent-message", methods=["POST"])
 def agent_message(req: func.HttpRequest) -> func.HttpResponse:
