@@ -16,24 +16,95 @@ class MaquinariaType(str, Enum):
     MANIPULADOR = "manipulador"
 
 class ConversationState(TypedDict):
-    messages: List[Dict[str, Any]]  # Cambiado para soportar campos adicionales
     nombre: Optional[str]
     apellido: Optional[str]
     tipo_maquinaria: Optional[MaquinariaType]
     detalles_maquinaria: Dict[str, Any]
-    sitio_web: Optional[str]
-    uso_empresa_o_venta: Optional[str]
     nombre_empresa: Optional[str]
     giro_empresa: Optional[str]
+    lugar_requerimiento: Optional[str]
+    uso_empresa_o_venta: Optional[str]
+    sitio_web: Optional[str]
     correo: Optional[str]
     telefono: Optional[str]
-    completed: bool
-    # Campos nuevos agregados
-    lugar_requerimiento: Optional[str]
+    # Campos que no se preguntan al usuario
+    messages: List[Dict[str, Any]]  # Cambiado para soportar campos adicionales
     conversation_mode: str  # "bot" | "agente"
     asignado_asesor: Optional[str]
+    completed: bool
     # ID del contacto en HubSpot
     hubspot_contact_id: Optional[str]
+
+# Configuración de prioridad de campos para la generación de preguntas
+# IMPORTANTE: El orden de los campos de esta variable es el orden en el que se hacen las preguntas
+FIELDS_CONFIG_PRIORITY = {
+    "nombre": {
+        "description": "Nombre del usuario",
+        "question": "¿Con quién tengo el gusto?", 
+        "reason": "Para brindarte atención personalizada",
+        "required": True
+    },
+    "apellido": {
+        "description": "Apellido del usuario",
+        "question": "¿Cuál es tu apellido?", 
+        "reason": "Para completar tu información personal",
+        "required": True
+    },
+    "tipo_maquinaria": {
+        "description": "Tipo de maquinaria que necesita",
+        "question": "¿Qué tipo de maquinaria requiere?", 
+        "reason": "Para revisar nuestro inventario disponible",
+        "required": True
+    },
+    "detalles_maquinaria": {
+        "description": "Detalles específicos de la máquina",
+        "question": None, 
+        "reason": None,
+        "required": False # Se maneja por separado en la función is_conversation_complete
+    },
+    "nombre_empresa": {
+        "description": "Nombre de la empresa",
+        "question": "¿Cuál es el nombre de su empresa?", 
+        "reason": "Para generar la cotización a nombre de su empresa",
+        "required": True
+    },
+    "giro_empresa": {
+        "description": "Giro o actividad de la empresa",
+        "question": "¿Cuál es el giro de su empresa?", 
+        "reason": "Para entender mejor sus necesidades específicas",
+        "required": True
+    },
+    "lugar_requerimiento": {
+        "description": "Ubicación donde se requiere la máquina",
+        "question": "¿En qué ubicación del país necesita el equipo?", 
+        "reason": "Para coordinar la entrega del equipo",
+        "required": True
+    },
+    "uso_empresa_o_venta": {
+        "description": "Si es para uso de la empresa o para venta",
+        "question": "¿El equipo es para uso de la empresa o para venta?", 
+        "reason": "Para ofrecerle los mejores precios",
+        "required": True
+    },
+    "sitio_web": {
+        "description": "Sitio web de la empresa",
+        "question": "¿Cuál es el sitio web de su empresa?", 
+        "reason": "Para conocer mejor su empresa y generar una cotización más precisa",
+        "required": False
+    },
+    "correo": {
+        "description": "Correo electrónico del usuario",
+        "question": "¿Cuál es su correo electrónico?", 
+        "reason": "Para enviarle la cotización",
+        "required": True
+    },
+    "telefono": {
+        "description": "Teléfono del usuario",
+        "question": "¿Cuál es su teléfono?", 
+        "reason": "Para darle seguimiento personalizado",
+        "required": True
+    }
+}
 
 class ConversationStateStore(ABC):
     """Interfaz para almacenar y recuperar estados de conversación"""
@@ -80,14 +151,29 @@ class CosmosDBStateStore(ConversationStateStore):
     def get_conversation_state(self, user_id: str) -> Optional[ConversationState]:
         """Recupera el estado de conversación desde Cosmos DB"""
         try:
-            # Buscar el documento por wa_id (partition key)
-            response = self.container.read_item(item=f"conv_{user_id}", partition_key=user_id)
+            # Primero verificar si el documento existe
+            item_id = f"conv_{user_id}"
+            
+            # Usar query para verificar existencia sin generar error
+            query = "SELECT c.id FROM c WHERE c.id = @item_id"
+            parameters = [{"name": "@item_id", "value": item_id}]
+            
+            items = list(self.container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=user_id
+            ))
+            
+            if not items:
+                logging.info(f"Lead nuevo detectado: {user_id}")
+                return None
+            
+            # Si existe, leer el documento completo
+            response = self.container.read_item(item=item_id, partition_key=user_id)
             logging.info(f"Estado existente cargado para usuario {user_id}")
             return self._cosmos_to_conversation_state(response)
+            
         except Exception as e:
-            if "Not Found" in str(e):
-                logging.info(f"Lead nuevo detectado: {user_id}")  # ✅ Log explícito
-                return None
             logging.error(f"Error recuperando estado de Cosmos DB: {e}")
             return None
     

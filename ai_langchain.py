@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 import langchain
 from maquinaria_config import MAQUINARIA_CONFIG, get_required_fields_for_tipo
-from state_management import MaquinariaType, ConversationState, ConversationStateStore, InMemoryStateStore
+from state_management import MaquinariaType, ConversationState, ConversationStateStore, InMemoryStateStore, FIELDS_CONFIG_PRIORITY
 from datetime import datetime, timezone
 import logging
 from hubspot_manager import HubSpotManager
@@ -79,6 +79,21 @@ def get_inventory():
         "modelo_maquinaria": "Cualquier modelo",
         "ubicacion": "Cualquier ubicación en México",
     }
+
+# ============================================================================
+# OBTENER EL ESTADO ACTUAL DE LOS CAMPOS EN UN STRING
+# ============================================================================
+
+def get_current_state_str(current_state: ConversationState) -> str:
+    """Obtiene el estado actual de los campos como una cadena de texto"""
+    field_names = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
+    fields_str = ""
+    for field in field_names:
+        if field == "detalles_maquinaria":
+            fields_str += f"- {field}: " + json.dumps(current_state.get(field) or {}) + "\n"
+        else:
+            fields_str += f"- {field}: " + (current_state.get(field) or "") + "\n"
+    return fields_str
 
 # ============================================================================
 # CONFIGURACIÓN DE AZURE OPENAI
@@ -155,12 +170,96 @@ class IntelligentSlotFiller:
         self.llm = azure_config.create_extraction_llm()  # Usar LLM optimizado para extracción
         self.parser = JsonOutputParser()
         
+    def detect_negative_response(self, message: str, last_bot_question: Optional[str] = None) -> Optional[Dict[str, str]]:
+        """
+        Detecta si el usuario está dando una respuesta negativa o de incertidumbre.
+        Retorna un diccionario con el tipo de respuesta y el campo específico, o None si no es una respuesta negativa.
+        Formato: {"response_type": "No tiene" o "No especificado", "field": "nombre_del_campo"}
+        """
+        prompt = ChatPromptTemplate.from_template(
+            """
+            Eres un asistente experto en detectar respuestas negativas o de incertidumbre y determinar a qué campo específico pertenecen.
+            
+            ÚLTIMA PREGUNTA DEL BOT: {last_bot_question}
+            MENSAJE DEL USUARIO: {message}
+            
+            INSTRUCCIONES:
+            Analiza si el usuario está dando una respuesta negativa o de incertidumbre y determina a qué campo específico pertenece.
+            
+            RESPUESTAS NEGATIVAS (response_type: "No tiene"):
+            - "no", "no tenemos", "no hay", "no tengo", "no cuenta con"
+            - "no tenemos página", "no tengo pagina web", "no tenemos sitio web"
+            - "no tengo correo", "no tengo teléfono", "no tengo empresa"
+            - "solo facebook", "solo instagram", "solo redes sociales"
+            - Cualquier variación de "no" + el objeto de la pregunta
+            
+            RESPUESTAS DE INCERTIDUMBRE (response_type: "No especificado"):
+            - "no sé", "no estoy seguro", "no lo sé", "no tengo idea"
+            - "no quiero dar esa información", "prefiero no decir", "es confidencial"
+            - "no estoy seguro", "tal vez", "posiblemente", "creo que no"
+            
+            CAMPOS DISPONIBLES:
+            {fields_available}
+            
+            Si NO es una respuesta negativa ni de incertidumbre, retorna "None".
+            
+            IMPORTANTE: Responde EXACTAMENTE en formato JSON:
+            - Si es respuesta negativa: {{"response_type": "No tiene", "field": "nombre_del_campo"}}
+            - Si es respuesta de incertidumbre: {{"response_type": "No especificado", "field": "nombre_del_campo"}}
+            - Si no es respuesta negativa: "None"
+            """
+        )
+        
+        try:
+            # Obtener campos disponibles desde el FIELDS_CONFIG_PRIORITY
+            fields_available = self._get_fields_available_str()
+
+            response = self.llm.invoke(prompt.format_prompt(
+                message=message,
+                last_bot_question=last_bot_question or "No hay pregunta previa",
+                fields_available=fields_available
+            ))
+            
+            result = response.content.strip()
+            
+            # Intentar parsear como JSON
+            try:
+                import json
+                parsed_result = json.loads(result)
+                if isinstance(parsed_result, dict) and "response_type" in parsed_result and "field" in parsed_result:
+                    return parsed_result
+                else:
+                    return None
+            except json.JSONDecodeError:
+                # Si no es JSON válido, verificar si es "None"
+                if result.lower() == "none":
+                    return None
+                else:
+                    return None
+                
+        except Exception as e:
+            logging.error(f"Error detectando respuesta negativa: {e}")
+            return None
+
     def extract_all_information(self, message: str, current_state: ConversationState, last_bot_question: Optional[str] = None) -> Dict[str, Any]:
         """
         Extrae TODA la información disponible en un solo mensaje
         Detecta qué slots se pueden llenar y cuáles ya están completos
         Incluye el contexto de la última pregunta del bot para mejor interpretación
         """
+        
+        # PRIMERO: Detectar si es una respuesta negativa o de incertidumbre
+        negative_response = self.detect_negative_response(message, last_bot_question)
+        
+        if negative_response:
+            # Si es una respuesta negativa, usar directamente el campo y valor proporcionados por el LLM
+            field_name = negative_response.get("field")
+            response_type = negative_response.get("response_type")
+            
+            if field_name and response_type:
+                return {field_name: response_type}
+            else:
+                return {}
         
         # Crear prompt que considere el estado actual y la última pregunta del bot
         prompt = ChatPromptTemplate.from_template(
@@ -171,17 +270,7 @@ class IntelligentSlotFiller:
             Solo extrae campos que NO estén ya completos en el estado actual.
             
             ESTADO ACTUAL:
-            - nombre: {current_nombre}
-            - apellido: {current_apellido}
-            - tipo_maquinaria: {current_tipo}
-            - detalles_maquinaria: {current_detalles}
-            - sitio_web: {current_sitio_web}
-            - uso_empresa_o_venta: {current_uso}
-            - nombre_empresa: {current_nombre_empresa}
-            - giro_empresa: {current_giro}
-            - lugar_requerimiento: {current_lugar_requerimiento}
-            - correo: {current_correo}
-            - telefono: {current_telefono}
+            {current_state_str}
             
             ÚLTIMA PREGUNTA DEL BOT: {last_bot_question}
             
@@ -189,41 +278,15 @@ class IntelligentSlotFiller:
             
             INSTRUCCIONES:
             1. Solo extrae campos que estén VACÍOS en el estado actual
-            2. Si un campo ya tiene valor, NO lo incluyas en la respuesta
-            3. Para detalles_maquinaria, solo incluye campos específicos que no estén ya llenos
-            4. Responde SOLO en formato JSON válido
-            5. IMPORTANTE: Si el mensaje del usuario no contiene información nueva para campos vacíos, responde con {{}} (JSON vacío)
-            6. NO extraigas información de campos que ya están llenos, incluso si el usuario dice algo que podría interpretarse como información
-            7. CLASIFICACIÓN INTELIGENTE: Si la última pregunta es sobre un campo específico, clasifica la respuesta en ese campo
+            2. Para detalles_maquinaria, solo incluye campos específicos que no estén ya llenos
+            3. Responde SOLO en formato JSON válido
+            4. IMPORTANTE: Si el mensaje del usuario no contiene información nueva para campos vacíos, responde con {{}} (JSON vacío)
+            5. NO extraigas información de campos que ya están llenos, incluso si el usuario dice algo que podría interpretarse como información
+            6. CLASIFICACIÓN INTELIGENTE: Si la última pregunta es sobre un campo específico, clasifica la respuesta en ese campo
             
             CAMPOS A EXTRAER (solo si están vacíos):
-            - nombre: nombre de la persona
-            - tipo_maquinaria: {maquinaria_names}
-            - detalles_maquinaria: objeto con campos específicos según tipo_maquinaria
-            - lugar_requerimiento: lugar donde se requiere la máquina
-            - sitio_web: URL del sitio web o "No tiene" (para respuestas negativas como "no", "no tenemos", "no cuenta", etc.)
-            - uso_empresa_o_venta: "uso empresa" o "venta"
-            - nombre_empresa: nombre de la empresa
-            - giro_empresa: giro o actividad de la empresa (ej: "venta de maquinaria", "construcción", "manufactura", "servicios", etc.)
-            - correo: dirección de email
-            - telefono: número telefónico
-            
-            REGLAS ESPECIALES PARA SITIO_WEB:
-            - Si el usuario dice algo como "no", "no tenemos", "no hay", "no tenemos página", "no tenemos sitio", "no tenemos página web" → sitio_web: "No tiene"
-            - Si el usuario proporciona una URL o sitio web → sitio_web: [URL]
-            - Si el usuario dice "solo facebook", "solo instagram", "solo redes sociales" → sitio_web: "No tiene"
-            
-            REGLAS ESPECIALES PARA TODOS LOS CAMPOS:
-            - Si el usuario dice "no tengo", "no sé", "no estoy seguro", "no lo sé", "no tengo idea", "aún no lo he decidido" → usar "No especificado" como valor
-            - Si el usuario dice "no quiero dar esa información", "prefiero no decir", "es confidencial" → usar "No especificado" como valor
-            - Si el usuario dice "no tengo correo", "no tengo teléfono", "no tengo empresa" → usar "No tiene" como valor
-            
-            REGLAS ESPECIALES PARA GIRO_EMPRESA:
-            - Si el usuario describe la actividad de su empresa → giro_empresa: [descripción de la actividad]
-            - Si el usuario dice "nos dedicamos a la [actividad]" → giro_empresa: [actividad]
-            - Ejemplos: "venta de maquinaria pesada", "construcción", "manufactura", "servicios de mantenimiento", "distribución", "logística", etc.
-            - Extrae la actividad principal, no solo palabras sueltas
-            
+            {fields_available}
+
             REGLAS ESPECIALES PARA NOMBRES:
             - Si el usuario dice "soy [nombre]", "me llamo [nombre]", "hola, soy [nombre]" → extraer nombre y apellido
             - Para nombres de 1 palabra: llenar solo "nombre"
@@ -231,43 +294,9 @@ class IntelligentSlotFiller:
             - Ejemplos: "soy Paco" → nombre: "Paco"
             - Ejemplos: "soy Paco Perez" → nombre: "Paco", apellido: "Perez"
             - Ejemplos: "soy Paco Perez Diaz" → nombre: "Paco", apellido: "Perez Diaz"
-            
-            REGLAS ESPECIALES PARA USO_EMPRESA_O_VENTA:
-            - Si el usuario dice "para venta", "es para vender", "para comercializar" → uso_empresa_o_venta: "venta"
-            - Si el usuario dice "para uso", "para usar", "para trabajo interno" → uso_empresa_o_venta: "uso empresa"
-            
-            EJEMPLOS DE EXTRACCIÓN:
-            - Mensaje: "soy Renato Fuentes" → {{"nombre": "Renato", "apellido": "Fuentes"}}
-            - Mensaje: "me llamo Mauricio Martinez Rodriguez" → {{"nombre": "Mauricio", "apellido": "Martinez Rodriguez"}}
-            - Mensaje: "no hay pagina web" → {{"sitio_web": "No tiene"}}
-            - Mensaje: "venta de maquinaria pesada" → {{"giro_empresa": "venta de maquinaria pesada"}}
-            - Mensaje: "para venta" → {{"uso_empresa_o_venta": "venta"}}
-            - Mensaje: "construcción y mantenimiento" → {{"giro_empresa": "construcción y mantenimiento"}}
-            - Mensaje: "en la Ciudad de México" → {{"lugar_requerimiento": "Ciudad de México"}}
-            - Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
-            - Mensaje: "555-1234" → {{"telefono": "555-1234"}}
-            
-            EJEMPLOS DE RESPUESTAS SIN INFORMACIÓN NUEVA:
-            - Mensaje: "no se" → {{}} (no hay información nueva)
-            - Mensaje: "aun no lo he decidido" → {{}} (no hay información nueva)
-            - Mensaje: "no estoy seguro" → {{}} (no hay información nueva)
-            - Mensaje: "no tengo idea" → {{}} (no hay información nueva)
-            
-            EJEMPLOS DE USO DEL CONTEXTO DE LA ÚLTIMA PREGUNTA:
-            - Última pregunta: "¿En qué compañía trabajas?" + Mensaje: "Facebook" → {{"nombre_empresa": "Facebook"}}
-            - Última pregunta: "¿Cuál es el giro de su empresa?" + Mensaje: "Construcción" → {{"giro_empresa": "Construcción"}}
-            - Última pregunta: "¿Cuál es su correo electrónico?" + Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
-            - Última pregunta: "¿Es para uso de la empresa o para venta?" + Mensaje: "Para venta" → {{"uso_empresa_o_venta": "venta"}}
-            - Última pregunta: "¿Su empresa cuenta con algún sitio web?" + Mensaje: "Solo Facebook" → {{"sitio_web": "No tiene"}}
 
-            REGLAS ESPECIALES PARA PREGUNTAS SOBRE INVENTARIO:
-            - Si el usuario pregunta "¿tienen [tipo]?" → extraer [tipo] como tipo_maquinaria
-            - Si el usuario pregunta "¿manejan [tipo]?" → extraer [tipo] como tipo_maquinaria  
-            - Si el usuario pregunta "necesito [tipo]" → extraer [tipo] como tipo_maquinaria
-            - Ejemplos: "¿tienen generadores?" → {{"tipo_maquinaria": "generador"}}
-            - Ejemplos: "¿manejan soldadoras?" → {{"tipo_maquinaria": "soldadora"}}
-            - Ejemplos: "necesito un compresor" → {{"tipo_maquinaria": "compresor"}}
-            IMPORTANTE: Incluso en preguntas sobre inventario, SIEMPRE extraer tipo_maquinaria si se menciona
+            Los tipos de maquinaria disponibles para el campo tipo_maquinaria son:
+            {maquinaria_names}
             
             REGLAS ADICIONALES PARA DETALLES DE MAQUINARIA - USA ESTOS NOMBRES EXACTOS:
             - Para TORRE_ILUMINACION: es_led (true/false para LED)
@@ -283,6 +312,43 @@ class IntelligentSlotFiller:
             - NO extraer campos que no estén en esta lista exacta
             - NO inventar campos adicionales como "proyecto", "aplicación", "capacidad_de_volumen", etc.
             
+            REGLAS ESPECIALES PARA GIRO_EMPRESA:
+            - Si el usuario describe la actividad de su empresa → giro_empresa: [descripción de la actividad]
+            - Si el usuario dice "nos dedicamos a la [actividad]" → giro_empresa: [actividad]
+            - Ejemplos: "venta de maquinaria pesada", "construcción", "manufactura", "servicios de mantenimiento", "distribución", "logística", etc.
+            - Extrae la actividad principal, no solo palabras sueltas
+            
+            REGLAS ESPECIALES PARA USO_EMPRESA_O_VENTA:
+            - Si el usuario dice "para venta", "es para vender", "para comercializar" → uso_empresa_o_venta: "venta"
+            - Si el usuario dice "para uso", "para usar", "para trabajo interno" → uso_empresa_o_venta: "uso empresa"
+            
+            EJEMPLOS DE EXTRACCIÓN:
+            - Mensaje: "soy Renato Fuentes" → {{"nombre": "Renato", "apellido": "Fuentes"}}
+            - Mensaje: "me llamo Mauricio Martinez Rodriguez" → {{"nombre": "Mauricio", "apellido": "Martinez Rodriguez"}}
+            - Mensaje: "venta de maquinaria" → {{"giro_empresa": "venta de maquinaria"}}
+            - Mensaje: "construcción y mantenimiento" → {{"giro_empresa": "construcción y mantenimiento"}}
+            - Mensaje: "para venta" → {{"uso_empresa_o_venta": "venta"}}
+            - Mensaje: "www.empresa.com" → {{"sitio_web": "www.empresa.com"}}
+            - Mensaje: "en la Ciudad de México" → {{"lugar_requerimiento": "Ciudad de México"}}
+            - Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
+            - Mensaje: "555-1234" → {{"telefono": "555-1234"}}
+            
+            EJEMPLOS DE USO DEL CONTEXTO DE LA ÚLTIMA PREGUNTA:
+            - Última pregunta: "¿En qué compañía trabajas?" + Mensaje: "Facebook" → {{"nombre_empresa": "Facebook"}}
+            - Última pregunta: "¿Cuál es el giro de su empresa?" + Mensaje: "Construcción" → {{"giro_empresa": "Construcción"}}
+            - Última pregunta: "¿Cuál es su correo electrónico?" + Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
+            - Última pregunta: "¿Es para uso de la empresa o para venta?" + Mensaje: "Para venta" → {{"uso_empresa_o_venta": "venta"}}
+            - Última pregunta: "¿Cuál es el sitio web de su empresa?" + Mensaje: "www.empresa.com" → {{"sitio_web": "www.empresa.com"}}
+
+            REGLAS ESPECIALES PARA PREGUNTAS SOBRE INVENTARIO:
+            - Si el usuario pregunta "¿tienen [tipo]?" → extraer [tipo] como tipo_maquinaria
+            - Si el usuario pregunta "¿manejan [tipo]?" → extraer [tipo] como tipo_maquinaria  
+            - Si el usuario pregunta "necesito [tipo]" → extraer [tipo] como tipo_maquinaria
+            - Ejemplos: "¿tienen generadores?" → {{"tipo_maquinaria": "generador"}}
+            - Ejemplos: "¿manejan soldadoras?" → {{"tipo_maquinaria": "soldadora"}}
+            - Ejemplos: "necesito un compresor" → {{"tipo_maquinaria": "compresor"}}
+            IMPORTANTE: Incluso en preguntas sobre inventario, SIEMPRE extraer tipo_maquinaria si se menciona
+            
             IMPORTANTE: Analiza cuidadosamente el mensaje y extrae TODA la información disponible que corresponda a campos vacíos.
             
             Respuesta (solo JSON):
@@ -292,24 +358,16 @@ class IntelligentSlotFiller:
         try:
             # Nombres de tipos de maquinaria
             maquinaria_names = " ".join([f"\"{name.value}\"" for name in MaquinariaType])
-            
-            current_detalles_str = json.dumps(current_state.get("detalles_maquinaria", {}), ensure_ascii=False)
+
+            # Obtener campos disponibles desde el FIELDS_CONFIG_PRIORITY
+            fields_available = self._get_fields_available_str()
 
             response = self.llm.invoke(prompt.format_prompt(
                 message=message,
-                current_nombre=current_state.get("nombre", "No especificado"),
-                current_apellido=current_state.get("apellido", "No especificado"),
-                current_tipo=current_state.get("tipo_maquinaria", "No especificado"),
-                current_detalles=current_detalles_str,
-                current_sitio_web=current_state.get("sitio_web", "No especificado"),
-                current_uso=current_state.get("uso_empresa_o_venta", "No especificado"),
-                current_nombre_empresa=current_state.get("nombre_empresa", "No especificado"),
-                current_giro=current_state.get("giro_empresa", "No especificado"),
-                current_lugar_requerimiento=current_state.get("lugar_requerimiento", "No especificado"),
-                current_correo=current_state.get("correo", "No especificado"),
-                current_telefono=current_state.get("telefono", "No especificado"),
+                current_state_str=get_current_state_str(current_state),
                 last_bot_question=last_bot_question or "No hay pregunta previa (inicio de conversación)",
-                maquinaria_names=maquinaria_names
+                maquinaria_names=maquinaria_names,
+                fields_available=fields_available
             ))
             
             debug_print(f"DEBUG: Respuesta completa del LLM: '{response.content}'")
@@ -329,23 +387,11 @@ class IntelligentSlotFiller:
         """
         
         try:
-            # Definir el orden de prioridad de los slots con explicaciones centralizadas
-            slot_priority = [
-                ("nombre", "¿Con quién tengo el gusto?", "Para brindarte atención personalizada"),
-                ("apellido", "¿Cuál es tu apellido?", "Para completar tu información personal"), # Solo se pregunta si en nombre solo dice 1 palabra
-                ("tipo_maquinaria", "¿Qué tipo de maquinaria requiere?", "Para revisar nuestro inventario disponible"),
-                ("detalles_maquinaria", None, None),  # Se maneja por separado
-                ("nombre_empresa", "¿Cuál es el nombre de su empresa?", "Para generar la cotización a nombre de su empresa"),
-                ("giro_empresa", "¿Cuál es el giro de su empresa?", "Para entender mejor sus necesidades específicas"), # Se pregunta junto con nombre_empresa
-                ("lugar_requerimiento", "¿En qué lugar necesita el equipo?", "Para coordinar la entrega del equipo"),
-                ("uso_empresa_o_venta", "¿El equipo es para uso de la empresa o para venta?", "Para ofrecerle los mejores precios"),
-                ("sitio_web", "¿Cuál es el sitio web de su empresa?", "Para conocer mejor su empresa y generar una cotización más precisa"),
-                ("correo", "¿Cuál es su correo electrónico?", "Para enviarle la cotización"),
-                ("telefono", "¿Cuál es su teléfono?", "Para darle seguimiento personalizado") # TODO: Solo se pregunta si está respondiendo todo de forma fluida
-            ]
-            
             # Verificar cada slot en orden de prioridad
-            for slot_name, question, reason in slot_priority:
+            for slot_name, data in FIELDS_CONFIG_PRIORITY.items():
+                question = data["question"]
+                reason = data["reason"]
+                
                 if slot_name == "detalles_maquinaria":
                     # Manejar detalles específicos de maquinaria
                     question_details = self._get_maquinaria_detail_question_with_reason(current_state)
@@ -355,7 +401,8 @@ class IntelligentSlotFiller:
                     # Verificar si el slot está vacío o tiene respuestas negativas
                     value = current_state.get(slot_name)
                     if not value:
-                        # Si se debe preguntar por el nombre de la empresa y no se tiene el giro, preguntar por el giro de la empresa también
+                        # Si se debe preguntar por el nombre de la empresa y no se tiene el giro,
+                        # preguntar por el giro de la empresa también.
                         if slot_name == "nombre_empresa" and not current_state.get("giro_empresa"):
                             question = "¿Cuál es el nombre y giro de su empresa?"
                         
@@ -371,6 +418,14 @@ class IntelligentSlotFiller:
         except Exception as e:
             logging.error(f"Error generando siguiente pregunta: {e}")
             return None
+
+    def _get_fields_available_str(self) -> str:
+        """Obtiene los campos disponibles como una lista de strings con su descripción"""
+        fields_available = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
+        fields_available_str = ""
+        for field in fields_available:
+            fields_available_str += f"- {field}: " + FIELDS_CONFIG_PRIORITY[field]['description'] + "\n"
+        return fields_available_str
     
     def _get_maquinaria_detail_question_with_reason(self, current_state: ConversationState) -> Optional[dict]:
         """Obtiene la siguiente pregunta específica sobre detalles de maquinaria de manera conversacional con el motivo"""
@@ -404,36 +459,30 @@ class IntelligentSlotFiller:
         nombre = current_state.get("nombre", "")
         if not nombre or len(nombre.split()) < 2:
             return False
-        
-        required_fields = [
-            "tipo_maquinaria", "lugar_requerimiento", "nombre_empresa", "giro_empresa",
-            "sitio_web", "uso_empresa_o_venta", "correo", "telefono"
-        ]
+
+        # Obtener campos obligatorios desde el FIELDS_CONFIG_PRIORITY
+        required_fields = [field for field in FIELDS_CONFIG_PRIORITY.keys() if FIELDS_CONFIG_PRIORITY[field]["required"]]
         
         # Verificar campos básicos
         for field in required_fields:
             value = current_state.get(field)
             if not value or value == "":
                 return False
-            # Solo considerar válidos los campos con información real, no respuestas negativas
-            if value in ["No tiene", "No especificado"]:
-                return False
         
         # Verificar detalles de maquinaria
-        tipo = current_state.get("tipo_maquinaria")
         detalles = current_state.get("detalles_maquinaria", {})
         
-        if not tipo or not detalles:
+        if not detalles:
             return False
         
         # Usar la configuración centralizada para obtener campos obligatorios
+        tipo = current_state.get("tipo_maquinaria")
         required_fields = get_required_fields_for_tipo(tipo)
         
         return all(
             field in detalles and 
             detalles[field] is not None and 
-            detalles[field] != "" and 
-            detalles[field] != "No especificado" 
+            detalles[field] != ""
             for field in required_fields
         )
 
@@ -472,16 +521,7 @@ class IntelligentResponseGenerator:
                 {extracted_info_str}
                 
                 ESTADO ACTUAL DE LA CONVERSACIÓN:
-                - Nombre: {current_nombre}
-                - Tipo de maquinaria: {current_tipo}
-                - Detalles: {current_detalles}
-                - Empresa: {current_empresa}
-                - Giro: {current_giro}
-                - Lugar requerimiento: {current_lugar_requerimiento}
-                - Sitio web: {current_sitio_web}
-                - Uso: {current_uso}
-                - Correo: {current_correo}
-                - Teléfono: {current_telefono}
+                {current_state_str}
                 
                 SIGUIENTE PREGUNTA A HACER: {next_question}
                 SOLO MENCIONA LA RAZÓN DE LA SIGUIENTE PREGUNTA SI EL USUARIO LO PREGUNTA: {next_question_reason}
@@ -495,6 +535,8 @@ class IntelligentResponseGenerator:
                 1. No repitas información que ya confirmaste anteriormente
                 2. {conectors_instruction}
                 3. Si hay una siguiente pregunta, hazla de manera natural
+                4. NO inventes preguntas adicionales
+                5. Si no hay siguiente pregunta, simplemente confirma la información recibida
                 
                 Genera una respuesta natural y apropiada:
             """
@@ -545,20 +587,13 @@ class IntelligentResponseGenerator:
             else:
                 conectors_instruction = "Si solo cuentas con el teléfono en el ESTADO ACTUAL DE LA CONVERSACIÓN, agradece por habernos contactado."
 
+            current_state_str = get_current_state_str(current_state)
+            print(f"DEBUG: current_state_str: {current_state_str}")
             formatedPrompt = prompt.format_prompt(
                 user_message=message,
+                current_state_str=current_state_str,
                 extracted_info_str=extracted_info_str,
-                current_nombre=current_state.get("nombre", "No especificado"),
                 primer_nombre=primer_nombre,
-                current_tipo=current_state.get("tipo_maquinaria", "No especificado"),
-                current_detalles=json.dumps(current_state.get("detalles_maquinaria", {}), ensure_ascii=False),
-                current_sitio_web=current_state.get("sitio_web", "No especificado"),
-                current_uso=current_state.get("uso_empresa_o_venta", "No especificado"),
-                current_lugar_requerimiento=current_state.get("lugar_requerimiento", "No especificado"),
-                current_empresa=current_state.get("nombre_empresa", "No especificado"),
-                current_giro=current_state.get("giro_empresa", "No especificado"),
-                current_correo=current_state.get("correo", "No especificado"),
-                current_telefono=current_state.get("telefono", "No especificado"),
                 next_question=next_question or "No hay siguiente pregunta",
                 next_question_reason=next_question_reason or "No hay razón para la siguiente pregunta",
                 inventory_instruction=inventory_instruction,
@@ -581,20 +616,13 @@ class IntelligentResponseGenerator:
     
     def generate_final_response(self, current_state: ConversationState) -> str:
         """Genera la respuesta final cuando la conversación está completa"""
+
+        current_state_str = get_current_state_str(current_state)
         
         return f"""¡Perfecto, {current_state['nombre']}! 
 
 He registrado toda su información:
-- Nombre: {current_state['nombre']}
-- Maquinaria: {current_state['tipo_maquinaria'].value}
-- Detalles: {json.dumps(current_state['detalles_maquinaria'], indent=2, ensure_ascii=False)}
-- Empresa: {current_state['nombre_empresa']}
-- Giro: {current_state['giro_empresa']}
-- Lugar requerimiento: {current_state['lugar_requerimiento']}
-- Uso: {current_state['uso_empresa_o_venta']}
-- Sitio web: {current_state['sitio_web']}
-- Correo: {current_state['correo']}
-- Teléfono: {current_state['telefono']}
+{current_state_str}
 
 Procederé a generar su cotización. Nos pondremos en contacto con usted pronto.
 
@@ -698,27 +726,28 @@ class IntelligentLeadQualificationChatbot:
 
     def _create_empty_state(self) -> ConversationState:
         """Crea un estado vacío"""
-        return {
-            "messages": [],
-            "nombre": None,
-            "apellido": None,
-            "tipo_maquinaria": None,
-            "detalles_maquinaria": {},
-            "sitio_web": None,
-            "uso_empresa_o_venta": None,
-            "nombre_empresa": None,
-            "giro_empresa": None,
-            "correo": None,
-            "telefono": None,
+        state = {
+            # Campos que no se preguntan al usuario
             "completed": False,
-            "lugar_requerimiento": None,
+            "messages": [],
             "conversation_mode": "bot",
             "asignado_asesor": None,
             "hubspot_contact_id": None
         }
+        
+        # Agregamos los campos que se preguntan al usuario desde el FIELDS_CONFIG_PRIORITY
+        fields_to_ask = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
+        for field in fields_to_ask:
+            if field == "detalles_maquinaria":
+                state[field] = {}
+            else:
+                state[field] = None
+
+        return state
     
     def load_conversation(self, user_id: str):
         """Carga la conversación de un usuario específico"""
+        logging.info(f"Cargando conversación para usuario {user_id}")
         self.current_user_id = user_id
         stored_state = self.state_store.get_conversation_state(user_id)
         
@@ -726,6 +755,7 @@ class IntelligentLeadQualificationChatbot:
             self.state = stored_state
             debug_print(f"DEBUG: Estado cargado para usuario {user_id}")
         else:
+            logging.info(f"No hay estado existente para usuario {user_id}, creando nuevo estado")
             self.state = self._create_empty_state()
             debug_print(f"DEBUG: Nuevo estado creado para usuario {user_id}")
 
@@ -815,6 +845,7 @@ class IntelligentLeadQualificationChatbot:
 
             if next_question is None:
                 debug_print(f"DEBUG: Estado completo: {self.state}")
+                self.state["completed"] = True
                 final_message = "Gracias por toda la información. Estoy procesando su solicitud."
                 return self._add_message_and_return_response(final_message)
 
@@ -888,7 +919,7 @@ class IntelligentLeadQualificationChatbot:
             # Esto es clave para evitar que una respuesta ambigua posterior
             # borre un dato que ya se había confirmado.
             current_value = self.state.get(key)
-            if key != "detalles_maquinaria" and current_value and current_value not in ["No especificado", "No tiene", None, ""]:
+            if key != "detalles_maquinaria" and current_value:
                 debug_print(f"DEBUG: Campo '{key}' ya tiene valor válido '{current_value}', no se sobrescribe.")
                 continue
 
@@ -942,24 +973,6 @@ class IntelligentLeadQualificationChatbot:
                 return content
         return None
     
-    def get_conversation_summary(self) -> Dict[str, Any]:
-        """Obtiene un resumen completo del lead calificado"""
-        return {
-            "nombre": self.state["nombre"],
-            "apellido": self.state["apellido"],
-            "tipo_maquinaria": self.state["tipo_maquinaria"],
-            "detalles_maquinaria": self.state["detalles_maquinaria"],
-            "nombre_empresa": self.state["nombre_empresa"],
-            "sitio_web": self.state["sitio_web"],
-            "giro_empresa": self.state["giro_empresa"],
-            "lugar_requerimiento": self.state["lugar_requerimiento"],
-            "uso_empresa_o_venta": self.state["uso_empresa_o_venta"],
-            "correo": self.state["correo"],
-            "telefono": self.state["telefono"],
-            "conversacion_completa": self.state["completed"],
-            "mensajes_total": len(self.state["messages"])
-        }
-    
     def get_lead_data_json(self) -> str:
         """Obtiene los datos del lead en formato JSON"""
-        return json.dumps(self.get_conversation_summary(), indent=2, ensure_ascii=False)
+        return json.dumps(get_current_state_str(self.state), indent=2, ensure_ascii=False)
