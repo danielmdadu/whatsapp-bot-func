@@ -161,6 +161,7 @@ class WhatsAppBot:
         """
         Verifica si el usuario está autorizado para usar el bot.
         """
+        logging.info(f"Verificando si el usuario {wa_id} está autorizado")
         authorized_ids = [
             os.environ['RECIPIENT_WAID'],
         ]
@@ -168,6 +169,8 @@ class WhatsAppBot:
             authorized_ids.append(os.environ['RECIPIENT_WAID_2'])
         if os.environ['RECIPIENT_WAID_3']:
             authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
+
+        logging.info(f"Authorized IDs: {authorized_ids}")
             
         return wa_id in authorized_ids
     

@@ -167,6 +167,7 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
     # Verificar que quien manda el mensaje esté autorizado
     # TODO: Eliminar en producción
     if not whatsapp_bot.is_authorized_user(wa_id):
+        logging.info(f"wa_id no autorizado: {wa_id}")
         logging.error("Unauthorized user!!!")
         return
 
