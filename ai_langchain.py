@@ -1,7 +1,7 @@
 import json
 import os
 import random
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -21,7 +21,7 @@ langchain.llm_cache = False
 # ============================================================================
 
 # Variable global para controlar si se muestran los prints de DEBUG
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 def debug_print(*args, **kwargs):
     """
@@ -46,9 +46,20 @@ CONFIRMATION_PHRASES = [
 # Lista de conectores para preguntas
 QUESTION_CONNECTORS = [
     "Ahora me podrías decir",
-    "También me podrías compartir",
     "Ahora puedes decirme",
-    "También necesito saber"
+    "También me podrías compartir",
+    "También necesito saber",
+    "Me podrías decir",
+    "Me puedes indicar",
+]
+
+# Lista de conectores repetir preguntas
+ASK_AGAIN_CONNECTORS = [
+    "Pero para poder darte la información correcta, aún necesito saber,",
+    "Para continuar, ¿me podrías indicar",
+    "Y solo para no perder el hilo, ¿podrías decirme",
+    "Entonces, volviendo a mi pregunta anterior,",
+    "Continuando con mi pregunta anterior, necesito saber,"
 ]
 
 def get_random_confirmation_phrase() -> str:
@@ -58,6 +69,10 @@ def get_random_confirmation_phrase() -> str:
 def get_random_question_connector() -> str:
     """Selecciona aleatoriamente un conector para preguntas"""
     return random.choice(QUESTION_CONNECTORS)
+
+def get_random_ask_again_connector() -> str:
+    """Selecciona aleatoriamente un conector para repetir preguntas"""
+    return random.choice(ASK_AGAIN_CONNECTORS)
 
 # ============================================================================
 # INVENTARIO FAKE
@@ -502,7 +517,8 @@ class IntelligentResponseGenerator:
         current_state: ConversationState, 
         next_question: str = None, 
         next_question_reason: str = None, 
-        is_inventory_question: bool = False
+        is_inventory_question: bool = False,
+        is_same_last_question: bool = False # Si la pregunta anterior es la misma que la última pregunta
     ) -> str:
         """Genera una respuesta contextual apropiada usando un enfoque conversacional"""
         
@@ -575,20 +591,28 @@ class IntelligentResponseGenerator:
                 
                 # Seleccionar frases aleatorias
                 confirmation_phrase = get_random_confirmation_phrase()
-                question_connector = get_random_question_connector()
-                
-                conectors_instruction = f"""
-                Si el mensaje del usuario proporciona alguna información solicitada, puedes iniciar el mensaje con una expresión breve de confirmación o agradecimiento según creas que sea apropiado, usando una frase como esta:
-                - {confirmation_phrase}, {primer_nombre}
-                
-                También, haz las preguntas como si fueran parte de una charla, usando un conector natural como este:
-                - '{question_connector}...'
-                """
+
+                if is_same_last_question:
+                    # Si estamos volviendo a preguntar, usamos la nueva lista
+                    question_connector = get_random_ask_again_connector()
+                    conectors_instruction = f"""
+                    El usuario no respondió tu pregunta anterior directamente. Responde brevemente a su mensaje si es necesario, y luego vuelve a hacer tu pregunta de forma amable usando un conector como este para reorientar la conversación:
+                    - '{question_connector}...'
+                    """
+                else:
+                    # Si es una pregunta normal, usamos la lógica original
+                    question_connector = get_random_question_connector()
+                    conectors_instruction = f"""
+                    Si el mensaje del usuario proporciona alguna información solicitada, puedes iniciar el mensaje con una expresión breve de confirmación, usando una frase como esta:
+                    - {confirmation_phrase}, {primer_nombre}.
+                    
+                    Luego, si necesitas preguntar algo más, hazlo de forma natural usando un conector como este:
+                    - '{question_connector}...'
+                    """
             else:
                 conectors_instruction = "Si solo cuentas con el teléfono en el ESTADO ACTUAL DE LA CONVERSACIÓN, agradece por habernos contactado."
 
             current_state_str = get_current_state_str(current_state)
-            print(f"DEBUG: current_state_str: {current_state_str}")
             formatedPrompt = prompt.format_prompt(
                 user_message=message,
                 current_state_str=current_state_str,
@@ -796,13 +820,14 @@ class IntelligentLeadQualificationChatbot:
                 "role": "user", 
                 "whatsapp_message_id": whatsapp_message_id,
                 "content": user_message,
+                "question_type": "",
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "sender": "lead"
             })
 
             # Extraer TODA la información disponible del mensaje (SIEMPRE)
             # Obtener la última pregunta del bot para contexto
-            last_bot_question = self._get_last_bot_question()
+            last_bot_question, last_bot_question_type = self._get_last_bot_question()
             extracted_info = self.slot_filler.extract_all_information(user_message, self.state, last_bot_question)
             debug_print(f"DEBUG: Información extraída: {extracted_info}") 
             
@@ -838,7 +863,7 @@ class IntelligentLeadQualificationChatbot:
                 debug_print(f"DEBUG: Conversación completa!")
                 self.state["completed"] = True
                 final_response = self.response_generator.generate_final_response(self.state)
-                return self._add_message_and_return_response(final_response)
+                return self._add_message_and_return_response(final_response, "")
             
             # Obtener la siguiente pregunta necesaria
             next_question = self.slot_filler.get_next_question(self.state)
@@ -847,7 +872,7 @@ class IntelligentLeadQualificationChatbot:
                 debug_print(f"DEBUG: Estado completo: {self.state}")
                 self.state["completed"] = True
                 final_message = "Gracias por toda la información. Estoy procesando su solicitud."
-                return self._add_message_and_return_response(final_message)
+                return self._add_message_and_return_response(final_message, "")
 
             next_question_str = next_question["question"]
             next_question_reason = next_question["reason"]
@@ -864,17 +889,18 @@ class IntelligentLeadQualificationChatbot:
                 self.state, 
                 next_question_str, 
                 next_question_reason, 
-                is_inventory_question
+                is_inventory_question,
+                last_bot_question_type == next_question_type
             )
             contextual_response += generated_response
 
-            return self._add_message_and_return_response(contextual_response)
+            return self._add_message_and_return_response(contextual_response, next_question_type)
         
         except Exception as e:
             logging.error(f"Error procesando mensaje: {e}")
             return "Disculpe, hubo un error técnico. ¿Podría intentar de nuevo?"
         
-    def _add_message_and_return_response(self, response: str) -> str:
+    def _add_message_and_return_response(self, response: str, question_type: str) -> str:
         """
         Añade un mensaje al estado y devuelve la respuesta final
         Si es un mensaje del bot y hay callback disponible, envía por WhatsApp primero
@@ -893,6 +919,7 @@ class IntelligentLeadQualificationChatbot:
         self.state["messages"].append({
             "role": "assistant", 
             "whatsapp_message_id": whatsapp_message_id,
+            "question_type": question_type,
             "content": response,
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sender": "bot"
@@ -955,23 +982,28 @@ class IntelligentLeadQualificationChatbot:
                 self.state[key] = value
                 debug_print(f"DEBUG: Campo '{key}' actualizado con valor: '{value}'")
         
-    def _get_last_bot_question(self) -> Optional[str]:
+    def _get_last_bot_question(self) -> Tuple[Optional[str], Optional[str]]:
         """Obtiene la última pregunta que hizo el bot para proporcionar contexto"""
-        # Buscar el último mensaje del bot en el historial
-        for msg in reversed(self.state["messages"]):
-            if msg["role"] == "assistant":
-                content = msg["content"]
-                # Si el mensaje contiene una pregunta, extraerla
-                if "?" in content:
-                    # Buscar la última línea que contenga una pregunta
-                    lines = content.split('\n')
-                    for line in reversed(lines):
-                        if "?" in line and line.strip():
-                            return line.strip()
-                    # Si no se encuentra una línea específica, devolver todo el contenido
-                    return content
-                return content
-        return None
+        try:
+            # Buscar el último mensaje del bot en el historial
+            for msg in reversed(self.state["messages"]):
+                if msg["role"] == "assistant" or msg["sender"] == "bot":
+                    content = msg["content"]
+                    question_type = msg["question_type"]
+                    # Si el mensaje contiene una pregunta, extraerla
+                    if "?" in content:
+                        # Buscar la última línea que contenga una pregunta
+                        lines = content.split('\n')
+                        for line in reversed(lines):
+                            if "?" in line and line.strip():
+                                return line.strip(), question_type
+                        # Si no se encuentra una línea específica, devolver todo el contenido
+                        return content, question_type
+                    return content, question_type
+            return None, None
+        except Exception as e:
+            logging.error(f"Error obteniendo última pregunta del bot: {e}")
+            return None, None
     
     def get_lead_data_json(self) -> str:
         """Obtiene los datos del lead en formato JSON"""

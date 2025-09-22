@@ -247,6 +247,7 @@ class CosmosDBStateStore(ConversationStateStore):
                 "whatsapp_message_id": msg.get("whatsapp_message_id", ""),
                 "sender": msg.get("sender", "lead" if msg["role"] == "user" else "bot"),
                 "text": msg["content"],
+                "question_type": msg.get("question_type", ""),
                 "timestamp": msg.get("timestamp", now),
                 "delivered": True,
                 "read": False
@@ -289,6 +290,7 @@ class CosmosDBStateStore(ConversationStateStore):
             msg_converted = {
                 "role": "user" if msg["sender"] == "lead" else "assistant",
                 "content": msg["text"],
+                "question_type": msg.get("question_type"),
                 "timestamp": msg.get("timestamp"),
                 "sender": msg["sender"]
             }
@@ -376,6 +378,7 @@ class CosmosDBStateStore(ConversationStateStore):
                     "whatsapp_message_id": msg.get("whatsapp_message_id", ""),
                     "sender": msg.get("sender", "lead" if msg["role"] == "user" else "bot"),
                     "text": msg["content"],
+                    "question_type": msg.get("question_type", ""),
                     "timestamp": msg.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
                     "delivered": True,
                     "read": False

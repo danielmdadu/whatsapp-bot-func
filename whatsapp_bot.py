@@ -162,19 +162,14 @@ class WhatsAppBot:
         Verifica si el usuario está autorizado para usar el bot.
         """
         try:
-
             logging.info(f"Verificando si el usuario {wa_id} está autorizado")
-            authorized_ids = [
-                os.environ['RECIPIENT_WAID'],
-            ]
-            logging.info("1 funciona")
-            if os.environ['RECIPIENT_WAID_2']:
+            authorized_ids = []
+            if "RECIPIENT_WAID" in os.environ:
+                authorized_ids.append(os.environ['RECIPIENT_WAID'])
+            if "RECIPIENT_WAID_2" in os.environ:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_2'])
-            logging.info("2 funciona")
-            # if os.environ['RECIPIENT_WAID_3']:
+            # if "RECIPIENT_WAID_3" in os.environ:
             #     authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
-
-            logging.info(f"Authorized IDs: {authorized_ids}")
                 
             return wa_id in authorized_ids
         except Exception as e:
