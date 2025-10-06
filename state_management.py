@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from hmac import new
 from typing import Optional, TypedDict, List, Dict, Any
 from enum import Enum
 from datetime import datetime, timezone
@@ -188,8 +189,7 @@ class CosmosDBStateStore(ConversationStateStore):
             
             if old_state is None:
                 # Primera vez: crear documento completo
-                cosmos_doc = self._conversation_state_to_cosmos(user_id, state)
-                self.container.upsert_item(cosmos_doc)
+                self._create_new_conversation_state(user_id, state)
                 logging.info(f"Documento inicial creado para usuario {user_id}")
                 return
             
@@ -198,7 +198,7 @@ class CosmosDBStateStore(ConversationStateStore):
             
             # 1. Verificar nuevos mensajes
             if self._has_new_messages(old_state, state):
-                new_messages = self._get_new_messages(old_state, state)
+                new_messages = self._get_new_message(state)
                 self._append_messages(user_id, new_messages)
                 changes_applied.append(f"{len(new_messages)} mensajes")
             
@@ -225,6 +225,37 @@ class CosmosDBStateStore(ConversationStateStore):
             cosmos_doc = self._conversation_state_to_cosmos(user_id, state)
             self.container.upsert_item(cosmos_doc)
             # logging.info(f"Estado guardado con fallback completo para usuario {user_id}")
+
+    def add_single_message(self, user_id: str, message_content: Any, whatsapp_message_id: str, state: ConversationState) -> None:
+        """Agrega un mensaje único al estado de conversación"""
+        try: 
+            # Si es una nueva conversación, crear un nuevo documento
+            if state.get("messages") == []:
+                self._create_new_conversation_state(user_id, state)
+            
+            # Formatear el mensaje
+            new_message = {
+                "whatsapp_message_id": whatsapp_message_id,
+                "sender": "lead",
+                "role": "user",
+                "content": "",
+                "question_type": "",
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            }
+
+            # Si es texto, agregar el texto en content, si es multimedia, agregar nuevo elemento "multimedia"
+            if isinstance(message_content, str):
+                new_message["content"] = message_content
+            else:
+                new_message["multimedia"] = message_content
+
+            logging.info(f"Agregando mensaje del usuario {user_id}: {new_message}")
+            
+            # Usar _append_messages para agregar el mensaje
+            self._append_messages(user_id, [new_message])
+        except Exception as e:
+            logging.error(f"Error agregando mensaje individual: {e}")
+            raise
     
     def delete_conversation_state(self, user_id: str) -> None:
         """Elimina el estado de conversación de Cosmos DB"""
@@ -234,6 +265,12 @@ class CosmosDBStateStore(ConversationStateStore):
         except Exception as e:
             if "Not Found" not in str(e):
                 logging.error(f"Error eliminando estado de Cosmos DB: {e}")
+
+    def _create_new_conversation_state(self, user_id: str, state: ConversationState) -> None:
+        """Crea un nuevo estado de conversación"""
+        cosmos_doc = self._conversation_state_to_cosmos(user_id, state)
+        self.container.upsert_item(cosmos_doc)
+        logging.info(f"Documento inicial creado para usuario {user_id}")
     
     def _conversation_state_to_cosmos(self, user_id: str, state: ConversationState) -> Dict[str, Any]:
         """Transforma ConversationState al formato de Cosmos DB"""
@@ -335,11 +372,11 @@ class CosmosDBStateStore(ConversationStateStore):
         new_messages = new_state.get("messages", [])
         return len(new_messages) > len(old_messages)
     
-    def _get_new_messages(self, old_state: ConversationState, new_state: ConversationState) -> List[Dict[str, Any]]:
+    def _get_new_message(self, new_state: ConversationState) -> List[Dict[str, Any]]:
         """Obtiene solo los mensajes nuevos"""
-        old_count = len(old_state.get("messages", []))
         new_messages = new_state.get("messages", [])
-        return new_messages[old_count:]
+        # Solo retorna el último mensaje porque el mensaje del lead se agregó previamente en WhatsAppBot.process_message
+        return new_messages[-1:]
     
     def _detect_field_changes(self, old_state: ConversationState, new_state: ConversationState) -> Dict[str, Any]:
         """Detecta qué campos del lead han cambiado"""
@@ -383,6 +420,10 @@ class CosmosDBStateStore(ConversationStateStore):
                     "delivered": True,
                     "read": False
                 }
+
+                if msg.get("multimedia"):
+                    msg_formatted["text"] = None
+                    msg_formatted["multimedia"] = msg["multimedia"]
                 formatted_messages.append(msg_formatted)
             
             # Usar patch operation para agregar mensajes

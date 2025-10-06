@@ -8,7 +8,7 @@ import os
 import requests
 from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot
 from state_management import ConversationStateStore
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 from datetime import datetime, timezone
 from hubspot_manager import HubSpotManager
 from check_guardrails import ContentSafetyGuardrails
@@ -65,28 +65,49 @@ class WhatsAppBot:
             return "52" + phone_number[3:]
         return phone_number
     
-    def get_text_message_input(self, recipient: str, text: str) -> str:
+    def get_text_message_input(self, recipient: str, message_type: str, content: str) -> str:
         """
         Crea el payload JSON para enviar un mensaje de texto vía WhatsApp API.
         """
         normalized_recipient = self.normalize_mexican_number(recipient)
-        return json.dumps({
+        payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
             "to": normalized_recipient,
-            "type": "text",
-            "text": {
+            "type": message_type
+        }
+        if message_type == "text":
+            payload["text"] = {
                 "preview_url": False,
-                "body": text
-            },
-        })
+                "body": content
+            }
+        elif message_type == "image":
+            payload["image"] = {
+                "id": content
+            }
+        elif message_type == "audio":
+            payload["audio"] = {
+                "id": content
+            }
+        elif message_type == "document":
+            payload["document"] = {
+                "id": content,
+                "filename": "archivo"
+            }
+        return json.dumps(payload)
     
-    def send_message(self, wa_id: str, text: str) -> Optional[str]:
+    def send_message(self, wa_id: str, text: str, multimedia: Dict[str, Any] = None) -> Optional[str]:
         """
         Envía un mensaje a través de WhatsApp API.
         """
         try:
-            data = self.get_text_message_input(wa_id, text)
+            data = None
+            if multimedia:
+                data = self.get_text_message_input(wa_id, multimedia["type"], multimedia["multimedia_id"])
+            else:
+                data = self.get_text_message_input(wa_id, "text", text)
+
+            logging.info(f"Data of message sent to WhatsApp API: {data}")
             headers = {
                 "Content-type": "application/json",
                 "Authorization": f"Bearer {self.access_token}",
@@ -113,6 +134,18 @@ class WhatsAppBot:
         El chatbot ahora envía automáticamente las respuestas por WhatsApp.
         """
         try:
+            # Verificar si es un comando especial
+            if message_text.lower() == "reset":
+                reset_response = self._handle_reset_command(wa_id, hubspot_manager)
+                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
+                self.send_message(wa_id, reset_response)
+                return
+            elif message_text.lower() == "status":
+                status_response = self._get_conversation_status(wa_id)
+                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
+                self.send_message(wa_id, status_response)
+                return
+
             # Verificar si el mensaje es seguro
             safety_result = self.guardrails.check_message_safety(message_text)
             if safety_result:
@@ -129,17 +162,8 @@ class WhatsAppBot:
                 self._save_safety_messages(wa_id, safety_result["message"], response_for_lead, whatsapp_ids)
                 return
 
-            # Verificar si es un comando especial
-            if message_text.lower() == "reset":
-                reset_response = self._handle_reset_command(wa_id, hubspot_manager)
-                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
-                self.send_message(wa_id, reset_response)
-                return
-            elif message_text.lower() == "status":
-                status_response = self._get_conversation_status(wa_id)
-                # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
-                self.send_message(wa_id, status_response)
-                return
+            # Guardamos el mensaje en la base de datos
+            self.state_store.add_single_message(wa_id, message_text, whatsapp_message_id, self.chatbot.state)
             
             # Procesar mensaje con LangChain (ahora envía automáticamente por WhatsApp)
             self.chatbot.send_message(message_text, whatsapp_message_id, hubspot_manager)
@@ -148,7 +172,18 @@ class WhatsAppBot:
             logging.error(f"Error procesando mensaje: {e}")
             error_message = "Disculpa, hubo un problema técnico. ¿Podrías repetir tu mensaje?"
             self.send_message(wa_id, error_message)
-    
+
+    def process_multimedia_msg(self, wa_id: str, multimedia: Dict[str, Any], whatsapp_message_id: str) -> None:
+        """
+        Procesa un mensaje multimedia entrante.
+        Actualmente solo responde que no se soportan mensajes multimedia.
+        """
+        try:
+            logging.info(f"Mensaje multimedia recibido de {wa_id}. Tipo: " + multimedia.get('type') + ".")
+            self.state_store.add_single_message(wa_id, multimedia, whatsapp_message_id, self.chatbot.state)
+        except Exception as e:
+            logging.error(f"Error procesando mensaje multimedia: {e}")
+
     def _handle_reset_command(self, wa_id: str, hubspot_manager: HubSpotManager) -> str:
         """Maneja el comando de reset"""
         hubspot_manager.delete_contact()
@@ -168,8 +203,8 @@ class WhatsAppBot:
                 authorized_ids.append(os.environ['RECIPIENT_WAID'])
             if "RECIPIENT_WAID_2" in os.environ:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_2'])
-            # if "RECIPIENT_WAID_3" in os.environ:
-            #     authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
+            if "RECIPIENT_WAID_3" in os.environ:
+                authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
                 
             return wa_id in authorized_ids
         except Exception as e:

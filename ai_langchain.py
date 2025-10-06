@@ -1,7 +1,7 @@
 import json
 import os
 import random
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -29,50 +29,6 @@ def debug_print(*args, **kwargs):
     """
     if DEBUG_MODE:
         logging.info(*args, **kwargs)
-
-# ============================================================================
-# SISTEMA DE FRASES ALEATORIAS
-# ============================================================================
-
-# Lista de frases de confirmación/agradecimiento
-CONFIRMATION_PHRASES = [
-    "Muy bien",
-    "Gracias por la información", 
-    "Excelente",
-    "Entendido",
-    "Perfecto"
-]
-
-# Lista de conectores para preguntas
-QUESTION_CONNECTORS = [
-    "Ahora me podrías decir",
-    "Ahora puedes decirme",
-    "También me podrías compartir",
-    "También necesito saber",
-    "Me podrías decir",
-    "Me puedes indicar",
-]
-
-# Lista de conectores repetir preguntas
-ASK_AGAIN_CONNECTORS = [
-    "Pero para poder darte la información correcta, aún necesito saber,",
-    "Para continuar, ¿me podrías indicar",
-    "Y solo para no perder el hilo, ¿podrías decirme",
-    "Entonces, volviendo a mi pregunta anterior,",
-    "Continuando con mi pregunta anterior, necesito saber,"
-]
-
-def get_random_confirmation_phrase() -> str:
-    """Selecciona aleatoriamente una frase de confirmación"""
-    return random.choice(CONFIRMATION_PHRASES)
-
-def get_random_question_connector() -> str:
-    """Selecciona aleatoriamente un conector para preguntas"""
-    return random.choice(QUESTION_CONNECTORS)
-
-def get_random_ask_again_connector() -> str:
-    """Selecciona aleatoriamente un conector para repetir preguntas"""
-    return random.choice(ASK_AGAIN_CONNECTORS)
 
 # ============================================================================
 # INVENTARIO FAKE
@@ -163,7 +119,7 @@ class AzureOpenAIConfig:
         return self.create_llm(
             temperature=0.7,  # Temperatura alta para respuestas más creativas y variadas
             top_p=0.95,       # Top-p alto para mayor diversidad
-            max_tokens=1000
+            max_tokens=75
         )
     
     def create_inventory_llm(self):
@@ -385,8 +341,6 @@ class IntelligentSlotFiller:
                 fields_available=fields_available
             ))
             
-            debug_print(f"DEBUG: Respuesta completa del LLM: '{response.content}'")
-            
             # Parsear la respuesta JSON
             result = self.parser.parse(response.content)
             return result
@@ -513,6 +467,7 @@ class IntelligentResponseGenerator:
     
     def generate_response(self, 
         message: str, 
+        history_messages: List[Dict[str, Any]],
         extracted_info: Dict[str, Any], 
         current_state: ConversationState, 
         next_question: str = None, 
@@ -525,13 +480,12 @@ class IntelligentResponseGenerator:
         try:
             # Crear prompt conversacional basado en el estilo de llm.py
             prompt_str = """
-                Eres un asesor comercial en Alpha C y un asistente de ventas profesional especializado en maquinaria de la empresa.
-                Tu trabajo es calificar leads de manera natural y conversacional.
-                
-                REGLAS IMPORTANTES:
-                - Sé amigable pero profesional
-                - No te presentes, ni digas palabras como "Hola", "Soy un asesor comercial en Alpha C"
-                - Mantén respuestas CORTAS (máximo 50 palabras)
+                Eres Juan, un asesor comercial en Alpha C y un asistente de ventas profesional especializado en maquinaria de la empresa.
+                Estás continuando una conversación con un lead.
+                Tu trabajo recolectar información de manera natural y conversacional, con un tono casual y amigable.
+
+                HISTORIAL DE CONVERSACIÓN:
+                {history_messages}
 
                 INFORMACIÓN EXTRAÍDA DEL ÚLTIMO MENSAJE:
                 {extracted_info_str}
@@ -549,10 +503,11 @@ class IntelligentResponseGenerator:
                 
                 INSTRUCCIONES:
                 1. No repitas información que ya confirmaste anteriormente
-                2. {conectors_instruction}
-                3. Si hay una siguiente pregunta, hazla de manera natural
-                4. NO inventes preguntas adicionales
-                5. Si no hay siguiente pregunta, simplemente confirma la información recibida
+                2. Si estás respondiendo al primer mensaje del usuario, presentate como Juan, asesor comercial de Alpha C
+                3. Si ya mencionaste el nombre del usuario, no lo menciones nuevamente
+                4. Si hay una siguiente pregunta, hazla de manera natural
+                5. NO inventes preguntas adicionales
+                6. Si no hay siguiente pregunta, simplemente confirma la información recibida
                 
                 Genera una respuesta natural y apropiada:
             """
@@ -583,45 +538,15 @@ class IntelligentResponseGenerator:
             else:
                 inventory_instruction = "Sigue las instrucciones dadas."
 
-            # Obtener el primer nombre del usuario
-            primer_nombre = current_state.get("nombre", "No especificado")
-            conectors_instruction = ""
-            if primer_nombre:
-                primer_nombre = primer_nombre.split()[0]
-                
-                # Seleccionar frases aleatorias
-                confirmation_phrase = get_random_confirmation_phrase()
-
-                if is_same_last_question:
-                    # Si estamos volviendo a preguntar, usamos la nueva lista
-                    question_connector = get_random_ask_again_connector()
-                    conectors_instruction = f"""
-                    El usuario no respondió tu pregunta anterior directamente. Responde brevemente a su mensaje si es necesario, y luego vuelve a hacer tu pregunta de forma amable usando un conector como este para reorientar la conversación:
-                    - '{question_connector}...'
-                    """
-                else:
-                    # Si es una pregunta normal, usamos la lógica original
-                    question_connector = get_random_question_connector()
-                    conectors_instruction = f"""
-                    Si el mensaje del usuario proporciona alguna información solicitada, puedes iniciar el mensaje con una expresión breve de confirmación, usando una frase como esta:
-                    - {confirmation_phrase}, {primer_nombre}.
-                    
-                    Luego, si necesitas preguntar algo más, hazlo de forma natural usando un conector como este:
-                    - '{question_connector}...'
-                    """
-            else:
-                conectors_instruction = "Si solo cuentas con el teléfono en el ESTADO ACTUAL DE LA CONVERSACIÓN, agradece por habernos contactado."
-
             current_state_str = get_current_state_str(current_state)
             formatedPrompt = prompt.format_prompt(
                 user_message=message,
                 current_state_str=current_state_str,
+                history_messages=history_messages,
                 extracted_info_str=extracted_info_str,
-                primer_nombre=primer_nombre,
                 next_question=next_question or "No hay siguiente pregunta",
                 next_question_reason=next_question_reason or "No hay razón para la siguiente pregunta",
-                inventory_instruction=inventory_instruction,
-                conectors_instruction=conectors_instruction
+                inventory_instruction=inventory_instruction
             )
             
             response = self.llm.invoke(formatedPrompt)
@@ -754,7 +679,7 @@ class IntelligentLeadQualificationChatbot:
             # Campos que no se preguntan al usuario
             "completed": False,
             "messages": [],
-            "conversation_mode": "bot",
+            "conversation_mode": "agente",
             "asignado_asesor": None,
             "hubspot_contact_id": None
         }
@@ -810,10 +735,6 @@ class IntelligentLeadQualificationChatbot:
             
             # Mensaje que se regresa
             contextual_response = ""
-
-            # Si es el primer mensaje (no hay mensajes anteriores), generar saludo inicial
-            if not self.state["messages"]:
-                contextual_response += "¡Hola! Soy un asesor comercial en Alpha C. "
             
             # Agregar mensaje del usuario
             self.state["messages"].append({
@@ -837,7 +758,6 @@ class IntelligentLeadQualificationChatbot:
 
             # Actualizar el estado con la información extraída
             self._update_state_with_extracted_info(extracted_info)
-            debug_print(f"DEBUG: Estado después de actualización: {self.state}")
 
             # Verificar modo de conversación antes de generar respuesta
             current_mode = self.state.get("conversation_mode", "bot")
@@ -862,7 +782,8 @@ class IntelligentLeadQualificationChatbot:
             if self.slot_filler.is_conversation_complete(self.state):
                 debug_print(f"DEBUG: Conversación completa!")
                 self.state["completed"] = True
-                final_response = self.response_generator.generate_final_response(self.state)
+                # final_response = self.response_generator.generate_final_response(self.state)
+                final_response = "Gracias por la información. Pronto te contactará nuestro asesor especializado."
                 return self._add_message_and_return_response(final_response, "")
             
             # Obtener la siguiente pregunta necesaria
@@ -871,7 +792,7 @@ class IntelligentLeadQualificationChatbot:
             if next_question is None:
                 debug_print(f"DEBUG: Estado completo: {self.state}")
                 self.state["completed"] = True
-                final_message = "Gracias por toda la información. Estoy procesando su solicitud."
+                final_message = "Gracias por la información. Pronto te contactará nuestro asesor especializado."
                 return self._add_message_and_return_response(final_message, "")
 
             next_question_str = next_question["question"]
@@ -882,9 +803,16 @@ class IntelligentLeadQualificationChatbot:
             next_question_type = next_question['question_type']
             debug_print(f"DEBUG: Tipo de siguiente pregunta: {next_question_type}")
 
+            # Extract only the role and content of the history messages
+            history_messages = [{
+                "role": msg["role"],
+                "content": msg["content"]
+            } for msg in self.state["messages"]]
+
             # Generar respuesta con LLM
             generated_response = self.response_generator.generate_response(
                 user_message, 
+                history_messages,
                 extracted_info, 
                 self.state, 
                 next_question_str, 
