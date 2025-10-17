@@ -152,8 +152,9 @@ class ContentSafetyGuardrails:
     def check_message_safety(self, message: str):  
         logging.info(f"Verificando seguridad del mensaje: {message}")      
         # Verificar inyección de código (no requiere API externa, es rápido)
-        logging.info(f"Verificando inyección de código: {self.detect_code_injection(message)}")
-        if self.detect_code_injection(message):
+        detect_code_injection_result = self.detect_code_injection(message)
+        logging.info(f"Verificando inyección de código: {detect_code_injection_result}")
+        if detect_code_injection_result:
             return {
                 "type": "code_injection",
                 "message": "MENSAJE INVÁLIDO: Se ha detectado un posible intento de inyección de código en el mensaje."
@@ -161,8 +162,8 @@ class ContentSafetyGuardrails:
 
         try:
             # Verificar seguridad de contenido
-            logging.info(f"Verificando seguridad de contenido: {self.check_content_safety(message)}")
             content_safety_result = self.check_content_safety(message)
+            logging.info(f"Verificando seguridad de contenido: {content_safety_result}")
             if content_safety_result:
                 return {
                     "type": "content_safety", 
@@ -170,8 +171,8 @@ class ContentSafetyGuardrails:
                 }
             
             # Verificar ataques de groundness
-            logging.info(f"Verificando ataques de groundness: {self.detect_groundness_result(message)}")
             groundness_result = self.detect_groundness_result(message)
+            logging.info(f"Verificando ataques de groundness: {groundness_result}")
             if groundness_result:
                 return {
                     "type": "groundness", 
@@ -179,12 +180,12 @@ class ContentSafetyGuardrails:
                 }
             
             # Verificar seguridad de conversación
-            logging.info(f"Verificando seguridad de conversación: {self.check_conversation_safety(message)}")
             conversation_safety_result = self.check_conversation_safety(message)
+            logging.info(f"Verificando seguridad de conversación: {conversation_safety_result}")
             if conversation_safety_result:
                 return {
                     "type": "invalid_conversation",
-                    "message": "MENSAJE INVÁLIDO: El mensaje contiene contenido fuera de dominio, es decir, el usuario probablemente está preguntando sobre algo que no es de maquinaria o quiere información que no se le debe dar."
+                    "message": "MENSAJE INVÁLIDO: El mensaje contiene contenido fuera de dominio, es decir, el usuario probablemente está preguntando sobre algo que no es de maquinaria o quiere información que no se le debe dar. Indícale que mantengan la conversación centrada en maquinaria."
                 }
         
         except TimeoutError:
@@ -193,7 +194,7 @@ class ContentSafetyGuardrails:
             logging.info(f"Timeout del mensaje")
             return {
                 "type": "timeout",
-                "message": "MENSAJE INVÁLIDO: El análisis de seguridad excedió el tiempo límite. Por favor, intenta con un mensaje más simple."
+                "message": "MENSAJE INVÁLIDO: El análisis de seguridad excedió el tiempo límite."
             }
         
         return None

@@ -149,18 +149,21 @@ class WhatsAppBot:
             # Verificar si el mensaje es seguro
             safety_result = self.guardrails.check_message_safety(message_text)
             if safety_result:
-                response_for_lead = "No me queda claro lo que dices. ¿Podrías explicarme mejor?"
-                # Enviar respuesta de seguridad por WhatsApp
-                whatsapp_message_id_response = self.send_message(wa_id, response_for_lead)
+                if safety_result["type"] == "invalid_conversation":
+                    message_text = "(FD) " + safety_result["message"] + " (FD) Mensaje del lead: " + message_text
+                else:
+                    response_for_lead = "No me queda claro lo que dices. ¿Podrías explicarme mejor?"
+                    # Enviar respuesta de seguridad por WhatsApp
+                    whatsapp_message_id_response = self.send_message(wa_id, response_for_lead)
 
-                # Ids de mensajes proporcionados por WhatsApp
-                whatsapp_ids = {
-                    "safety_message": whatsapp_message_id,
-                    "response_for_lead": whatsapp_message_id_response
-                }
-                # Guardar mensajes de seguridad en la base de datos
-                self._save_safety_messages(wa_id, safety_result["message"], response_for_lead, whatsapp_ids)
-                return
+                    # Ids de mensajes proporcionados por WhatsApp
+                    whatsapp_ids = {
+                        "safety_message": whatsapp_message_id,
+                        "response_for_lead": whatsapp_message_id_response
+                    }
+                    # Guardar mensajes de seguridad en la base de datos
+                    self._save_safety_messages(wa_id, safety_result["message"], response_for_lead, whatsapp_ids)
+                    return
 
             # Guardamos el mensaje en la base de datos
             self.state_store.add_single_message(wa_id, message_text, whatsapp_message_id, self.chatbot.state)
