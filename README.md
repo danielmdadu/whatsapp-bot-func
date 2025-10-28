@@ -7,6 +7,7 @@ VERIFY_TOKEN
 RECIPIENT_WAID # Se eliminará en producción
 RECIPIENT_WAID_2 # (opcional)
 RECIPIENT_WAID_3 # (opcional)
+RECIPIENT_WAID_4 # (opcional)
 WHATSAPP_ACCESS_TOKEN
 PHONE_NUMBER_ID
 WHATSAPP_API_VERSION
@@ -202,4 +203,3 @@ El sistema incluye logging detallado para:
 ## Contribución
 
 Este proyecto está diseñado para ser escalable y mantenible, con una arquitectura modular que permite fácil extensión de funcionalidades y mejoras en el procesamiento de lenguaje natural.
-

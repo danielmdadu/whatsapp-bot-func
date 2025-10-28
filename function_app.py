@@ -340,6 +340,9 @@ def agent_message(req: func.HttpRequest) -> func.HttpResponse:
         # Obtener el campo de multimedia
         multimedia = body.get("multimedia")
         logging.info(f"Multimedia: {multimedia}")
+
+        template_name = body.get("template_name")
+        logging.info(f"Template Name: {template_name}")
         
         if not wa_id:
             return func.HttpResponse("Missing wa_id", status_code=400)
@@ -348,7 +351,7 @@ def agent_message(req: func.HttpRequest) -> func.HttpResponse:
         whatsapp_bot = create_whatsapp_bot()
         
         # Enviar mensaje al lead vía WhatsApp
-        whatsapp_message_id = whatsapp_bot.send_message(wa_id, message, multimedia)
+        whatsapp_message_id = whatsapp_bot.send_message(wa_id, message, multimedia, template_name)
 
         if whatsapp_message_id:
             # Regresar el ID de WhatsApp del mensaje
@@ -358,4 +361,89 @@ def agent_message(req: func.HttpRequest) -> func.HttpResponse:
             
     except Exception as e:
         logging.error(f"Error en endpoint agent-message: {e}")
+        return func.HttpResponse("Internal server error", status_code=500)
+
+@app.route(route="start-bot-mode", methods=["POST"])
+def start_bot_mode(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Endpoint para activar el modo bot y procesar el último mensaje del lead.
+    Verifica si el último mensaje fue enviado por el lead y, si es así,
+    lo procesa y genera una respuesta contextual.
+    """
+    logging.info('Endpoint start-bot-mode activado')
+    
+    try:
+        # Validar que sea POST
+        if req.method != 'POST':
+            return func.HttpResponse("Method not allowed", status_code=405)
+        
+        # Obtener datos del request
+        body = req.get_json()
+        if not body:
+            return func.HttpResponse("Invalid JSON", status_code=400)
+        
+        # Validar campo requerido
+        wa_id = body.get("wa_id")
+        if not wa_id:
+            return func.HttpResponse("Missing wa_id", status_code=400)
+        
+        logging.info(f"Procesando start-bot-mode para wa_id: {wa_id}")
+        
+        # Crear instancia de WhatsAppBot
+        whatsapp_bot = create_whatsapp_bot()
+        
+        # Procesar el último mensaje del lead
+        response = whatsapp_bot.chatbot.process_last_lead_message(wa_id)
+        
+        if response:
+            logging.info(f"Respuesta generada para {wa_id}: {response}")
+            return func.HttpResponse(json.dumps({
+                "success": True,
+                "message": "Bot mode activated and response generated",
+                "response": response
+            }), status_code=200, mimetype="application/json")
+        else:
+            logging.info(f"No se generó respuesta para {wa_id} - último mensaje no es del lead")
+            return func.HttpResponse(json.dumps({
+                "success": False,
+                "message": "No response generated - last message was not from lead"
+            }), status_code=200, mimetype="application/json")
+            
+    except Exception as e:
+        logging.error(f"Error en endpoint start-bot-mode: {e}")
+        return func.HttpResponse(json.dumps({
+            "success": False,
+            "message": "Internal server error",
+            "error": str(e)
+        }), status_code=500, mimetype="application/json")
+
+@app.route(route="new-lead-form", methods=["POST"])
+def new_lead_form(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Endpoint para procesar el formulario de nuevo lead.
+    """
+    logging.info('Endpoint new-lead-form activado')
+    
+    try:
+        # Validar que sea POST
+        if req.method != 'POST':
+            return func.HttpResponse("Method not allowed", status_code=405)
+        
+        # Obtener datos del request
+        body = req.get_json()
+        if not body:
+            return func.HttpResponse("Invalid JSON", status_code=400)
+        
+        logging.info(f"Body: {body}")
+        
+        # Validar campo requerido
+        email_body = body.get("email_body")
+        if not email_body:
+            return func.HttpResponse("Missing email_body", status_code=400)
+
+        logging.info(f"Procesando new-lead-form para email_body: {email_body}")
+
+        return func.HttpResponse("OK", status_code=200)
+    except Exception as e:
+        logging.error(f"Error en endpoint new-lead-form: {e}")
         return func.HttpResponse("Internal server error", status_code=500)

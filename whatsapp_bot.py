@@ -8,7 +8,7 @@ import os
 import requests
 from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot
 from state_management import ConversationStateStore
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from hubspot_manager import HubSpotManager
 from check_guardrails import ContentSafetyGuardrails
@@ -64,6 +64,42 @@ class WhatsAppBot:
         if phone_number.startswith("521") and len(phone_number) >= 12:
             return "52" + phone_number[3:]
         return phone_number
+
+    def get_template_text(self, template_name: str) -> str:
+        """
+        Obtiene el texto de una plantilla de WhatsApp.
+        """
+        lead_name = self.chatbot.state.get("nombre", "") if self.chatbot.state.get("nombre") else ""
+        lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
+
+        if template_name == "notificacion_de_leads":
+            return f"Hola {lead_name}, mi nombre es Alejandro Gómez asesor comercial de Alpha C. Me pongo en contacto contigo para dar seguimiento a tu interés en la siguiente maquinaria: {lead_machine_type}. Para continuar con tu solicitud, ¿me podrías confirmar si la maquinaria la requieres para venta o uso propio?"
+        elif template_name == "seguimiento_conversacion":
+            return f"""Hola {lead_name}, intentamos comunicarnos contigo para brindarte la información del equipo que solicitaste.
+            ¿Sigues interesado en recibir la información o una cotización?
+            Quedamos a tus órdenes para cotizar o resolver cualquier duda que tengas."""
+
+    def get_template_components(self, wa_id: str, template_name: str) -> List[Dict[str, Any]]:
+        """
+        Obtiene los componentes de una plantilla de WhatsApp.
+        """
+        self.chatbot.load_conversation(wa_id)
+        lead_name = self.chatbot.state.get("nombre", "") if self.chatbot.state.get("nombre") else ""
+        lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
+        logging.info(f"Nombre de lead: {lead_name}, Tipo de maquinaria: {lead_machine_type}")
+        
+        if template_name == "seguimiento_formulario":
+            return [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": lead_name},
+                        {"type": "text", "text": lead_machine_type}
+                    ]
+                }
+            ]
+        else:
+            return None
     
     def get_text_message_input(self, recipient: str, message_type: str, content: str) -> str:
         """
@@ -94,9 +130,17 @@ class WhatsAppBot:
                 "id": content,
                 "filename": "archivo"
             }
+        elif message_type == "template":
+            payload["template"] = {
+                "name": content,
+                "language": {
+                    "code": "es_MX"
+                },
+                "components": self.get_template_components(recipient, content)
+            }
         return json.dumps(payload)
     
-    def send_message(self, wa_id: str, text: str, multimedia: Dict[str, Any] = None) -> Optional[str]:
+    def send_message(self, wa_id: str, text: str, multimedia: Dict[str, Any] = None, template_name: str = None) -> Optional[str]:
         """
         Envía un mensaje a través de WhatsApp API.
         """
@@ -104,6 +148,8 @@ class WhatsAppBot:
             data = None
             if multimedia:
                 data = self.get_text_message_input(wa_id, multimedia["type"], multimedia["multimedia_id"])
+            elif template_name:
+                data = self.get_text_message_input(wa_id, "template", template_name)
             else:
                 data = self.get_text_message_input(wa_id, "text", text)
 
@@ -122,7 +168,7 @@ class WhatsAppBot:
             
             logging.info(f"Mensaje enviado exitosamente, response: {response.json()}")
             # Mensaje enviado exitosamente, response: {'messaging_product': 'whatsapp', 'contacts': [{'input': '529931340372', 'wa_id': '5219931340372'}], 'messages': [{'id': 'wamid.HBgNNTIxOTkzMTM0MDM3MhUCABEYEjNDMUE3QkFFRjBGQjMxNzBGNQA='}]}
-            return whatsapp_message_id
+            return whatsapp_message_id + "___" + self.get_template_text(template_name) if template_name else whatsapp_message_id
             
         except Exception as e:
             logging.error(f"Error enviando mensaje a {wa_id}: {e}")
@@ -208,6 +254,8 @@ class WhatsAppBot:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_2'])
             if "RECIPIENT_WAID_3" in os.environ:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
+            if "RECIPIENT_WAID_4" in os.environ:
+                authorized_ids.append(os.environ['RECIPIENT_WAID_4'])
                 
             return wa_id in authorized_ids
         except Exception as e:

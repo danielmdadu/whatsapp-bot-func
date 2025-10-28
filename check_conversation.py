@@ -42,6 +42,7 @@ def clasificar_mensaje(message: str) -> str:
             "   - Solicitudes de cotización\n"
             "   - Información personal del cliente (nombre, empresa, contacto, lugar de requerimiento)\n"
             "   - Preguntas sobre por qué necesita ciertos datos\n"
+            "   - Preguntas sobre cómo se llama el asistente\n"
             "   - Detalles sobre proyectos que requieren maquinaria\n\n"
             
             "2. COMPETENCIA_PROHIBIDO - Consultas sobre otros proveedores:\n"
@@ -54,7 +55,6 @@ def clasificar_mensaje(message: str) -> str:
             "   - Historia, ciencia general\n"
             "   - Entretenimiento, deportes, cultura\n"
             "   - Tecnología no relacionada con maquinaria\n"
-            "   - Chistes, conversación casual\n"
             "   - Política, religión, temas controversiales\n\n"
             
             "EJEMPLOS IMPORTANTES:\n"

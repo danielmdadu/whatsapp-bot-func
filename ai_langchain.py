@@ -480,7 +480,7 @@ class IntelligentResponseGenerator:
         try:
             # Crear prompt conversacional basado en el estilo de llm.py
             prompt_str = """
-                Eres Juan, un asesor comercial en Alpha C y un asistente de ventas profesional especializado en maquinaria de la empresa.
+                Eres Alejandro Gómez, un asesor comercial en Alpha C y un asistente de ventas profesional especializado en maquinaria de la empresa.
                 Estás continuando una conversación con un lead.
                 Tu trabajo recolectar información de manera natural y conversacional, con un tono casual y amigable.
 
@@ -503,11 +503,12 @@ class IntelligentResponseGenerator:
                 
                 INSTRUCCIONES:
                 1. No repitas información que ya confirmaste anteriormente
-                2. Si estás respondiendo al primer mensaje del usuario, presentate como Juan, asesor comercial de Alpha C
-                3. Si ya mencionaste el nombre del usuario, no lo menciones nuevamente
-                4. Si hay una siguiente pregunta, hazla de manera natural
-                5. NO inventes preguntas adicionales
-                6. Si no hay siguiente pregunta, simplemente confirma la información recibida
+                2. Si estás respondiendo al primer mensaje del usuario, presentate como Alejandro Gómez, asesor comercial de Alpha C
+                3. Si ya te presentaste, no lo repitas nuevamente
+                4. Si ya mencionaste el nombre del usuario, no lo menciones nuevamente
+                5. Si hay una siguiente pregunta, hazla de manera natural
+                6. NO inventes preguntas adicionales
+                7. Si no hay siguiente pregunta, simplemente confirma la información recibida
                 
                 Genera una respuesta natural y apropiada:
             """
@@ -936,3 +937,81 @@ class IntelligentLeadQualificationChatbot:
     def get_lead_data_json(self) -> str:
         """Obtiene los datos del lead en formato JSON"""
         return json.dumps(get_current_state_str(self.state), indent=2, ensure_ascii=False)
+    
+    def process_last_lead_message(self, wa_id: str) -> Optional[str]:
+        """
+        Procesa el último mensaje del lead y genera una respuesta contextual.
+        Esta función es específica para el endpoint /start-bot-mode.
+        """
+        try:
+            debug_print(f"DEBUG: Procesando último mensaje del lead para {wa_id}")
+
+            self.load_conversation(wa_id)
+                        
+            # Verificar que hay mensajes en la conversación
+            messages = self.state.get("messages", [])
+            if not messages:
+                debug_print(f"DEBUG: No hay mensajes en la conversación para {wa_id}")
+                return None
+            
+            # Obtener el último mensaje
+            last_message = messages[-1]
+            
+            # Verificar que el último mensaje sea del lead
+            if last_message.get("sender") != "lead" and last_message.get("role") != "user":
+                debug_print(f"DEBUG: El último mensaje no es del lead para {wa_id}")
+                return None
+            
+            # Obtener el contenido del mensaje
+            message_content = last_message.get("content", "")
+            if not message_content or not message_content.strip():
+                debug_print(f"DEBUG: El último mensaje del lead está vacío para {wa_id}")
+                return None
+            
+            debug_print(f"DEBUG: Procesando mensaje del lead: '{message_content}'")
+            
+            # Verificar si es una pregunta sobre inventario
+            is_inventory_question = self.inventory_responder.is_inventory_question(message_content)
+            
+            # Obtener la última pregunta del bot para contexto
+            _, last_bot_question_type = self._get_last_bot_question()
+
+            # Obtener la siguiente pregunta necesaria
+            next_question = self.slot_filler.get_next_question(self.state)
+            
+            # Verificar si la conversación está completa
+            if self.slot_filler.is_conversation_complete(self.state) or next_question is None:
+                debug_print(f"DEBUG: Conversación completa para {wa_id}")
+                self.state["completed"] = True
+                final_response = "Gracias por la información. Pronto te contactará nuestro asesor especializado."
+                return self._add_message_and_return_response(final_response, "")
+            
+            next_question_str = next_question["question"]
+            next_question_reason = next_question["reason"]
+            next_question_type = next_question['question_type']
+            
+            debug_print(f"DEBUG: Siguiente pregunta: {next_question_str}")
+            
+            # Preparar historial de mensajes para el contexto
+            history_messages = [{
+                "role": msg["role"],
+                "content": msg["content"]
+            } for msg in self.state["messages"]]
+            
+            # Generar respuesta contextual
+            generated_response = self.response_generator.generate_response(
+                message_content, 
+                history_messages,
+                {}, 
+                self.state, 
+                next_question_str, 
+                next_question_reason, 
+                is_inventory_question,
+                last_bot_question_type == next_question_type
+            )
+            
+            return self._add_message_and_return_response(generated_response, next_question_type)
+            
+        except Exception as e:
+            logging.error(f"Error procesando último mensaje del lead: {e}")
+            return "Disculpe, hubo un error técnico. ¿Podría intentar de nuevo?"
