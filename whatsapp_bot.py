@@ -88,13 +88,22 @@ class WhatsAppBot:
         lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
         logging.info(f"Nombre de lead: {lead_name}, Tipo de maquinaria: {lead_machine_type}")
         
-        if template_name == "seguimiento_formulario":
+        if template_name == "notificacion_de_leads":
             return [
                 {
                     "type": "body",
                     "parameters": [
                         {"type": "text", "text": lead_name},
                         {"type": "text", "text": lead_machine_type}
+                    ]
+                }
+            ]
+        elif template_name == "seguimiento_conversacion":
+            return [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": lead_name}
                     ]
                 }
             ]
