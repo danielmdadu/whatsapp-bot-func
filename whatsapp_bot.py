@@ -269,7 +269,7 @@ class WhatsAppBot:
             if "RECIPIENT_WAID_4" in os.environ:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_4'])
 
-            return wa_id in authorized_ids || true # Allow all the recipients
+            return wa_id in authorized_ids or True # Allow all the recipients
         except Exception as e:
             logging.error(f"Error verificando si el usuario {wa_id} está autorizado: {e}")
             return False
