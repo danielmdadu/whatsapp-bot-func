@@ -164,11 +164,19 @@ class ContentSafetyGuardrails:
             # Verificar seguridad de contenido
             content_safety_result = self.check_content_safety(message)
             logging.info(f"Verificando seguridad de contenido: {content_safety_result}")
+
+            # Check allowlist for machinery terms that trigger false positives
+            allowed_terms = ["motobomba", "cortadora", "bomba", "corte"]
+            is_allowed = any(term in message.lower() for term in allowed_terms)
+
             if content_safety_result:
-                return {
-                    "type": "content_safety", 
-                    "message": "MENSAJE INVÁLIDO: El mensaje contiene contenido inapropiado, es decir, el usuario probablemente usó lenguaje con contenido sexual, violento, de odio o autoagresión."
-                }
+                if is_allowed:
+                    logging.warning(f"⚠️ Contenido marcado como inseguro pero permitido por lista blanca: {message}")
+                else:
+                    return {
+                        "type": "content_safety", 
+                        "message": "MENSAJE INVÁLIDO: El mensaje probablemente tiene contenido inapropiado, es decir, el usuario probablemente usó lenguaje con contenido sexual, violento, de odio o autoagresión. Indícale que mantengan la conversación centrada en maquinaria si es necesario."
+                    }
             
             # Verificar ataques de groundness
             groundness_result = self.detect_groundness_result(message)
