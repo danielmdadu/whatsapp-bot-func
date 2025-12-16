@@ -207,7 +207,7 @@ class WhatsAppBot:
             # Verificar si el mensaje es seguro
             safety_result = self.guardrails.check_message_safety(message_text)
             if safety_result:
-                if safety_result["type"] == "invalid_conversation":
+                if safety_result["type"] == "invalid_conversation" or safety_result["type"] == "content_safety":
                     message_text = "(FD) " + safety_result["message"] + " (FD) Mensaje del lead: " + message_text
                 else:
                     response_for_lead = "No me queda claro lo que dices. ¿Podrías explicarme mejor?"
