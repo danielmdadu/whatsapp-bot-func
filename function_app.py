@@ -70,11 +70,44 @@ def create_whatsapp_bot() -> WhatsAppBot:
     Mejora: Elimina estado global y garantiza aislamiento entre requests.
     """
     try:
-        # Crear el state store apropiado para el entorno
+        # 1. Crear el state store apropiado para el entorno
         state_store = create_state_store()
         
+        # 2. Inicializar servicios de Maquinaria e Inventario con conexión a DB si está disponible
+        cosmos_client = None
+        db_name = None
+        
+        # Reusar el cliente si ya se creó en create_state_store (mejora: optimizar esto)
+        if isinstance(state_store, CosmosDBStateStore):
+            cosmos_client = state_store.cosmos_client
+            db_name = state_store.database_name
+        elif all(key in os.environ for key in ["COSMOS_CONNECTION_STRING", "COSMOS_DB_NAME"]):
+             # Si no estamos usando CosmosDBStateStore pero queremos cargar datos de DB (ej: desarrollo local)
+             try:
+                cosmos_client = CosmosClient.from_connection_string(os.environ["COSMOS_CONNECTION_STRING"])
+                db_name = os.environ["COSMOS_DB_NAME"]
+             except Exception:
+                 pass
+
+        # Inicializar e inyectar en las variables globales (o pasar al bot si refactorizamos WhatsAppBot)
+        
+        # IMPORTANTE: Aquí actualizamos las instancias globales que usan machinery_config_service e inventory_service
+        # Esto es un patrón temporal hasta que WhatsAppBot acepte inyección de dependencias completa
+        from maquinaria_config import machinery_config_service
+        
+        # Re-inicializar servicios con el cliente
+        machinery_config_service.__init__(cosmos_client, db_name)
+        
+        # Nota: InventoryService se instancia dentro de IntelligentResponseGenerator usualmente, 
+        # pero para que use la DB necesitamos pasarle el cliente.
+        # Esto requiere que WhatsAppBot -> IntelligentLeadQualificationChatbot -> IntelligentResponseGenerator 
+        # acepten la inyección.
+        
+        # Por ahora, vamos a pasar los servicios al constructor de WhatsAppBot (ver siguientes pasos)
+        
         # Crear instancia fresca del bot
-        bot = WhatsAppBot(state_store=state_store)
+        # Pasamos el cliente para que el bot pueda propagarlo
+        bot = WhatsAppBot(state_store=state_store, cosmos_client=cosmos_client, db_name=db_name)
         logging.info("WhatsApp bot creado exitosamente para request")
         
         return bot

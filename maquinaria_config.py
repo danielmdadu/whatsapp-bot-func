@@ -2,249 +2,145 @@
 Configuración centralizada de maquinaria
 """
 
-from typing import List
+from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from state_management import MaquinariaType
 
 # ============================================================================
-# MODELOS DE DATOS PARA DETALLES DE MAQUINARIA
+# MODELOS DE DATOS PARA CONFIGURACIÓN (SCHEMA)
 # ============================================================================
 
-class DetallesSoldadora(BaseModel):
-    amperaje: str = Field(None, description="Amperaje requerido para la soldadora")
-    electrodo: str = Field(None, description="Tipo de electrodo que quema")
+class MachineryFieldSchema(BaseModel):
+    name: str = Field(..., description="Nombre del campo (clave interna)")
+    question: str = Field(..., description="Pregunta que hace el bot al usuario")
+    reason: str = Field(..., description="Razón por la cual se pide este dato")
+    type: str = Field("text", description="Tipo de dato: text, number, boolean, selection")
+    required: bool = Field(True, description="Si es obligatorio")
+    # Campos para futura lógica de filtrado
+    comparison_operator: str = Field("eq", description="Operador de comparación por defecto: eq, gte, lte, contains")
+    unit: Optional[str] = Field(None, description="Unidad de medida si aplica (m, kg, cfm, etc)")
 
-class DetallesCompresor(BaseModel):
-    capacidad_volumen: str = Field(None, description="Capacidad de volumen de aire requerida")
-    herramientas_conectar: str = Field(None, description="Herramientas que va a conectar")
-
-class DetallesTorre(BaseModel):
-    es_led: bool = Field(None, description="Si requiere LED o no")
-
-class DetallesPlataforma(BaseModel):
-    altura_trabajo: str = Field(None, description="Altura de trabajo necesaria")
-    actividad: str = Field(None, description="Actividad que va a realizar")
-    ubicacion: str = Field(None, description="Si es en interior o exterior")
-
-class DetallesGenerador(BaseModel):
-    actividad: str = Field(None, description="Para qué actividad lo requiere")
-    capacidad: str = Field(None, description="Capacidad en kvas o kw necesaria")
-
-class DetallesRompedor(BaseModel):
-    uso: str = Field(None, description="Para qué lo va a utilizar")
-    tipo: str = Field(None, description="Si lo requiere eléctrico o neumático")
-
-class DetallesApisonador(BaseModel):
-    uso: str = Field(None, description="Para qué lo va a utilizar")
-    motor: str = Field(None, description="Qué tipo de motor trae")
-    es_diafragma: bool = Field(None, description="Si es de diafragma o no")
-
-class DetallesMontacargas(BaseModel):
-    capacidad: str = Field(None, description="Capacidad requerida")
-    tipo_energia: str = Field(None, description="Si lo requiere eléctrico, a combustión a gasolina o gas lp")
-    posicion_operador: str = Field(None, description="Si lo requiere para hombre parado o sentado")
-    altura: str = Field(None, description="Altura requerida")
-
-class DetallesManipulador(BaseModel):
-    capacidad: str = Field(None, description="Capacidad requerida")
-    altura: str = Field(None, description="Altura necesaria")
-    actividad: str = Field(None, description="Actividad que va a realizar")
-    tipo_energia: str = Field(None, description="Si lo requiere eléctrico o a combustión")
+class MachineryTypeSchema(BaseModel):
+    type_id: str
+    name: str
+    display_name: Optional[str] = None  # Nombre amigable (plural) para mostrar al usuario
+    fields: List[MachineryFieldSchema]
 
 # ============================================================================
-# CONFIGURACIÓN CENTRALIZADA DE MAQUINARIA
+# NOMBRES AMIGABLES (PLURAL) PARA MOSTRAR AL USUARIO
+# Respaldo en código por si el config (Cosmos) aún no trae 'display_name'.
+# Es la fuente de verdad para responder "¿qué máquinas manejan?".
 # ============================================================================
 
-MAQUINARIA_CONFIG = {
-    MaquinariaType.SOLDADORAS: {
-        "model": DetallesSoldadora,
-        "fields": [
-            {
-                "name": "amperaje", 
-                "reason": "Para recomendarte el modelo adecuado según tu trabajo",
-                "question": "¿cuál es el amperaje que necesitas?",
-                "required": True
-            },
-            {
-                "name": "electrodo", 
-                "reason": "Para asegurar compatibilidad con tus materiales",
-                "question": "¿qué tipo de electrodo quemas?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.COMPRESOR: {
-        "model": DetallesCompresor,
-        "fields": [
-            {
-                "name": "capacidad_volumen", 
-                "reason": "Para seleccionar la potencia correcta",
-                "question": "¿cuál es la capacidad de volumen de aire necesitas?",
-                "required": True
-            },
-            {
-                "name": "herramientas_conectar", 
-                "reason": "Para verificar compatibilidad con tus equipos",
-                "question": "¿qué herramientas le vas a conectar?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.TORRE_ILUMINACION: {
-        "model": DetallesTorre,
-        "fields": [
-            {
-                "name": "es_led", 
-                "reason": "Para determinar el tipo de iluminación necesario",
-                "question": "¿prefieres iluminación LED?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.PLATAFORMA: {
-        "model": DetallesPlataforma,
-        "fields": [
-            {
-                "name": "altura_trabajo", 
-                "reason": "Para asegurar que la máquina alcance la altura necesaria",
-                "question": "¿cuál es la altura de trabajo que necesitas?",
-                "required": True
-            },
-            {
-                "name": "actividad", 
-                "reason": "Para entender el contexto de uso",
-                "question": "¿qué actividad vas a realizar?",
-                "required": True
-            },
-            {
-                "name": "ubicacion", 
-                "reason": "Para determinar el modelo más conveniente",
-                "question": "¿es para interior o exterior?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.GENERADORES: {
-        "model": DetallesGenerador,
-        "fields": [
-            {
-                "name": "actividad", 
-                "reason": "Para entender el contexto de uso",
-                "question": "¿para qué actividad lo requiere?",
-                "required": True
-            },
-            {
-                "name": "capacidad", 
-                "reason": "Para determinar la potencia necesaria",
-                "question": "¿qué capacidad en kvas o kw necesitas?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.ROMPEDORES: {
-        "model": DetallesRompedor,
-        "fields": [
-            {
-                "name": "uso", 
-                "reason": "Para entender el contexto de uso",
-                "question": "¿para qué lo va a utilizar?",
-                "required": True
-            },
-            {
-                "name": "tipo", 
-                "reason": "Para determinar el tipo de energía necesaria",
-                "question": "¿lo requiere eléctrico o neumático?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.APISONADOR: {
-        "model": DetallesApisonador,
-        "fields": [
-            {
-                "name": "uso", 
-                "reason": "Para entender el contexto de uso",
-                "question": "¿para qué lo va a utilizar?",
-                "required": True
-            },
-            {
-                "name": "motor", 
-                "reason": "Para determinar las características del equipo",
-                "question": "¿qué tipo de motor debe tener?",
-                "required": True
-            },
-            {
-                "name": "es_diafragma", 
-                "reason": "Para determinar si lo requiere",
-                "question": "¿el equipo debe ser de diafragma?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.MONTACARGAS: {
-        "model": DetallesMontacargas,
-        "fields": [
-            {
-                "name": "capacidad", 
-                "reason": "Para determinar la capacidad necesaria",
-                "question": "¿qué peso requiere levantar?",
-                "required": True
-            },
-            {
-                "name": "tipo_energia", 
-                "reason": "Para determinar el tipo de energía adecuado",
-                "question": "¿lo requiere eléctrico, a combustión a gasolina o gas lp?",
-                "required": True
-            },
-            {
-                "name": "posicion_operador", 
-                "reason": "Para determinar la posición del operador",
-                "question": "¿lo requiere para hombre parado o sentado?",
-                "required": True
-            },
-            {
-                "name": "altura", 
-                "reason": "Para determinar la altura necesaria",
-                "question": "¿qué altura requiere?",
-                "required": True
-            }
-        ]
-    },
-    MaquinariaType.MANIPULADOR: {
-        "model": DetallesManipulador,
-        "fields": [
-            {
-                "name": "capacidad", 
-                "reason": "Para determinar la capacidad necesaria",
-                "question": "¿qué peso requiere mover?",
-                "required": True
-            },
-            {
-                "name": "altura", 
-                "reason": "Para determinar la altura necesaria",
-                "question": "¿qué altura necesita?",
-                "required": True
-            },
-            {
-                "name": "actividad", 
-                "reason": "Para entender el contexto de uso",
-                "question": "¿qué actividad va a realizar?",
-                "required": True
-            },
-            {
-                "name": "tipo_energia", 
-                "reason": "Para determinar el tipo de energía adecuado",
-                "question": "¿lo requiere eléctrico o a combustión?",
-                "required": True
-            }
-        ]
-    }
+TYPE_DISPLAY_NAMES: Dict[str, str] = {
+    "soldadora": "soldadoras",
+    "compresor": "compresores",
+    "rompedor": "rompedores (martillos neumáticos)",
+    "motobomba": "motobombas",
+    "apisonador": "apisonadores",
+    "generador": "generadores",
+    "cortadora_varillas": "cortadoras de varilla",
+    "dobladora_varillas": "dobladoras de varilla",
+    "torre_iluminacion": "torres de iluminación",
+    "montacargas": "montacargas",
+    "plataforma": "plataformas de elevación",
+    "manipulador": "manipuladores telescópicos",
 }
 
-def get_required_fields_for_tipo(tipo: MaquinariaType) -> List[str]:
-    """Obtiene lista de campos obligatorios para un tipo de maquinaria"""
-    if tipo not in MAQUINARIA_CONFIG:
-        return []
+# ============================================================================
+# SERVICIO DE CONFIGURACIÓN
+# ============================================================================
+
+class MachineryConfigService:
+    """
+    Servicio para gestionar la configuración de tipos de maquinaria.
+    Lee de la base de datos Cosmos DB (contenedor: machinery_configuration).
+    """
     
-    config = MAQUINARIA_CONFIG[tipo]
-    return [field["name"] for field in config["fields"] if field.get("required", True)]
+    def __init__(self, cosmos_client=None, database_name=None):
+        self._configs: Dict[str, MachineryTypeSchema] = {}
+        if cosmos_client and database_name:
+            self._db = cosmos_client.get_database_client(database_name)
+            self._container = self._db.get_container_client("machinery_configuration")
+            self._load_configs_from_db()
+        else:
+             # Fallback logic or empty init for testing/offline support if needed
+             # For now we can keep the local load as fallback or strictly require DB
+             self._configs = self._load_initial_configs_fallback()
+
+    def _load_configs_from_db(self):
+        """Carga configuraciones desde Cosmos DB"""
+        try:
+            # Query all items
+            items = list(self._container.read_all_items())
+            for item in items:
+                # Clean system properties if necessary, though Pydantic usually ignores extras unless configured otherwise
+                # But read_all_items returns dicts.
+                try:
+                    # Remove Cosmos DB specific fields to avoid Pydantic validation errors if strict
+                    clean_item = {k: v for k, v in item.items() if not k.startswith("_")}
+                    schema = MachineryTypeSchema(**clean_item)
+                    self._configs[schema.type_id] = schema
+                except Exception as e:
+                    print(f"Error loading config for item {item.get('id')}: {e}")
+            print(f"Loaded {len(self._configs)} machinery configurations from Cosmos DB.")
+        except Exception as e:
+            print(f"Error connecting/reading from Cosmos DB (machinery_configuration): {e}")
+            # Fallback to local file if DB fails? 
+            # For now let's just log. Implementation plan implies switching 'to' DB.
+
+    def _load_initial_configs_fallback(self) -> Dict[str, MachineryTypeSchema]:
+        """
+        Carga la configuración inicial desde machinery_data.py (Fallback).
+        """
+        try:
+            from update_invertory_db.machinery_data import machinery_configurations
+            configs = {}
+            for config_data in machinery_configurations:
+                schema = MachineryTypeSchema(**config_data)
+                configs[schema.type_id] = schema
+            return configs
+        except ImportError:
+            return {}
+
+    def get_config(self, type_id: str) -> Optional[MachineryTypeSchema]:
+        """Obtiene la configuración para un tipo de maquinaria específico"""
+        return self._configs.get(type_id)
+
+    def get_all_types(self) -> List[MachineryTypeSchema]:
+        """Obtiene todas las configuraciones de tipos de maquinaria"""
+        return list(self._configs.values())
+
+    def get_type_display_name(self, type_id: str) -> str:
+        """
+        Nombre amigable (plural) de un tipo para mostrar al usuario.
+        Prioridad: display_name del config (Cosmos) → mapa de respaldo → name → type_id.
+        """
+        config = self._configs.get(type_id)
+        if config and getattr(config, "display_name", None):
+            return config.display_name
+        if type_id in TYPE_DISPLAY_NAMES:
+            return TYPE_DISPLAY_NAMES[type_id]
+        if config and config.name:
+            return config.name
+        return type_id
+
+    def get_type_display_list(self) -> List[str]:
+        """Lista de nombres amigables de TODOS los tipos manejados (en el orden del config)."""
+        return [self.get_type_display_name(t.type_id) for t in self.get_all_types()]
+
+    def get_required_fields(self, type_id: str) -> List[str]:
+        """Obtiene una lista de los nombres de campos obligatorios para un tipo de maquinaria"""
+        config = self.get_config(type_id)
+        if not config:
+            return []
+        
+        return [field.name for field in config.fields if field.required]
+
+
+
+# Instancia Global (se inicializará en function_app.py o startup)
+machinery_config_service = MachineryConfigService()  # Default to blank/fallback until correctly initialized with DB client
+
+def get_required_fields_for_tipo(tipo: str) -> List[str]:
+    """Helper function para compatibilidad hacia atrás"""
+    return machinery_config_service.get_required_fields(tipo)
