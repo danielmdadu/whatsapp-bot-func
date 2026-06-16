@@ -5,29 +5,21 @@ from enum import Enum
 from datetime import datetime, timezone
 import logging
 
-class MaquinariaType(str, Enum):
-    SOLDADORAS = "soldadora"
-    COMPRESOR = "compresor"
-    TORRE_ILUMINACION = "torre_iluminacion"
-    PLATAFORMA = "plataforma"
-    GENERADORES = "generador"
-    ROMPEDORES = "rompedor"
-    APISONADOR = "apisonador"
-    MONTACARGAS = "montacargas"
-    MANIPULADOR = "manipulador"
-
 class ConversationState(TypedDict):
     nombre: Optional[str]
     apellido: Optional[str]
-    tipo_maquinaria: Optional[MaquinariaType]
+    tipo_ayuda: Optional[str]  # "maquinaria" | "otro" (refacciones, créditos, etc.)
+    tipo_maquinaria: Optional[str] # Ahora es string dinámico
     detalles_maquinaria: Dict[str, Any]
+    maquina_seleccionada: Optional[str]  # Modelo de la máquina seleccionada para cotización
+    maquinas_recomendadas: List[str]  # Lista de modelos recomendados (para mapear "la 1" a modelo)
     nombre_empresa: Optional[str]
     giro_empresa: Optional[str]
     lugar_requerimiento: Optional[str]
-    uso_empresa_o_venta: Optional[str]
-    sitio_web: Optional[str]
+    tipo_cliente: Optional[str]
     correo: Optional[str]
     telefono: Optional[str]
+    constancia_fiscal_entregada: Optional[bool]
     # Campos que no se preguntan al usuario
     messages: List[Dict[str, Any]]  # Cambiado para soportar campos adicionales
     conversation_mode: str  # "bot" | "agente"
@@ -35,6 +27,8 @@ class ConversationState(TypedDict):
     completed: bool
     # ID del contacto en HubSpot
     hubspot_contact_id: Optional[str]
+    # Control del flujo de cotización
+    quiere_cotizacion: Optional[str]  # "sí" | "no" | None (None = aún no se ha mostrado el mensaje o no ha respondido)
 
 # Configuración de prioridad de campos para la generación de preguntas
 # IMPORTANTE: El orden de los campos de esta variable es el orden en el que se hacen las preguntas
@@ -51,11 +45,17 @@ FIELDS_CONFIG_PRIORITY = {
         "reason": "Para completar tu información personal",
         "required": True
     },
+    "tipo_ayuda": {
+        "description": "Tipo de ayuda que necesita el usuario",
+        "question": "¿En qué te puedo ayudar?", 
+        "reason": "Para entender mejor cómo puedo asistirte",
+        "required": True
+    },
     "tipo_maquinaria": {
         "description": "Tipo de maquinaria que necesita",
         "question": "¿Qué tipo de maquinaria requiere?", 
         "reason": "Para revisar nuestro inventario disponible",
-        "required": True
+        "required": False  # Solo requerido si tipo_ayuda es "maquinaria"
     },
     "detalles_maquinaria": {
         "description": "Detalles específicos de la máquina",
@@ -63,47 +63,59 @@ FIELDS_CONFIG_PRIORITY = {
         "reason": None,
         "required": False # Se maneja por separado en la función is_conversation_complete
     },
+    "quiere_cotizacion": {
+        "description": "Si quiere cotización",
+        "question": "¿Quieres que te cotice alguna de las maquinarias disponibles?",
+        "reason": "Para ofrecer opciones de maquinaria disponibles",
+        "required": False
+    },
+    "maquina_seleccionada": {
+        "description": "Modelo exacto de la máquina seleccionada para cotización",
+        "question": None,
+        "reason": None,
+        "required": False
+    },
     "nombre_empresa": {
         "description": "Nombre de la empresa",
         "question": "¿Cuál es el nombre de su empresa?", 
         "reason": "Para generar la cotización a nombre de su empresa",
-        "required": True
+        "required": False
     },
     "giro_empresa": {
         "description": "Giro o actividad de la empresa",
         "question": "¿Cuál es el giro de su empresa?", 
         "reason": "Para entender mejor sus necesidades específicas",
-        "required": True
+        "required": False
     },
     "lugar_requerimiento": {
         "description": "Ubicación donde se requiere la máquina",
         "question": "¿En qué ubicación del país necesita el equipo?", 
         "reason": "Para coordinar la entrega del equipo",
-        "required": True
+        "required": False
     },
-    "uso_empresa_o_venta": {
-        "description": "Si es para uso de la empresa o para venta",
-        "question": "¿El equipo es para uso de la empresa o para venta?", 
+    "tipo_cliente": {
+        "description": "Si es un cliente final o distribuidor",
+        "question": "¿El equipo es para venta o renta?", 
         "reason": "Para ofrecerle los mejores precios",
-        "required": True
-    },
-    "sitio_web": {
-        "description": "Sitio web de la empresa",
-        "question": "¿Cuál es el sitio web de su empresa?", 
-        "reason": "Para conocer mejor su empresa y generar una cotización más precisa",
         "required": False
     },
     "correo": {
         "description": "Correo electrónico del usuario",
         "question": "¿Cuál es su correo electrónico?", 
         "reason": "Para enviarle la cotización",
-        "required": True
+        "required": False
     },
     "telefono": {
         "description": "Teléfono del usuario",
         "question": "¿Cuál es su teléfono?", 
         "reason": "Para darle seguimiento personalizado",
-        "required": True
+        "required": False
+    },
+    "constancia_fiscal_entregada": {
+        "description": "Si el usuario ya entregó o adjuntó su Constancia de Situación Fiscal",
+        "question": "Por favor comparta su Constancia de Situación Fiscal",
+        "reason": "Para verificar su información y brindarle precio preferencial",
+        "required": False
     }
 }
 
@@ -298,9 +310,8 @@ class CosmosDBStateStore(ConversationStateStore):
         state_copy.pop("asignado_asesor", None)
         state_copy.pop("hubspot_contact_id", None)
         
-        # Convertir MaquinariaType a string para JSON
-        if state_copy.get("tipo_maquinaria"):
-            state_copy["tipo_maquinaria"] = state_copy["tipo_maquinaria"].value
+        # Tipo de maquinaria ya es string, no requiere conversión
+        pass
         
         cosmos_doc = {
             "id": f"conv_{user_id}",
@@ -333,31 +344,32 @@ class CosmosDBStateStore(ConversationStateStore):
             }
             messages.append(msg_converted)
         
-        # Convertir string a MaquinariaType si existe
-        if state.get("tipo_maquinaria"):
-            try:
-                state["tipo_maquinaria"] = MaquinariaType(state["tipo_maquinaria"])
-            except ValueError:
-                state["tipo_maquinaria"] = None
+        # Tipo de maquinaria ya es string
+        pass
         
         # Crear ConversationState con todos los campos
         conversation_state: ConversationState = {
             "messages": messages,
             "nombre": state.get("nombre"),
             "apellido": state.get("apellido"),
+            "tipo_ayuda": state.get("tipo_ayuda"),
             "tipo_maquinaria": state.get("tipo_maquinaria"),
             "detalles_maquinaria": state.get("detalles_maquinaria", {}),
-            "sitio_web": state.get("sitio_web"),
-            "uso_empresa_o_venta": state.get("uso_empresa_o_venta"),
+            "maquina_seleccionada": state.get("maquina_seleccionada"),
+            "maquinas_recomendadas": state.get("maquinas_recomendadas", []),
+            "tipo_cliente": state.get("tipo_cliente"),
             "nombre_empresa": state.get("nombre_empresa"),
             "giro_empresa": state.get("giro_empresa"),
             "correo": state.get("correo"),
             "telefono": state.get("telefono"),
             "completed": state.get("completed", False),
+            "cotizacion_enviada": state.get("cotizacion_enviada", False),
             "lugar_requerimiento": state.get("lugar_requerimiento"),
             "conversation_mode": cosmos_doc.get("conversation_mode", "bot"),
             "asignado_asesor": cosmos_doc.get("asignado_asesor"),
-            "hubspot_contact_id": cosmos_doc.get("hubspot_contact_id")
+            "hubspot_contact_id": cosmos_doc.get("hubspot_contact_id"),
+            "quiere_cotizacion": state.get("quiere_cotizacion"),
+            "constancia_fiscal_entregada": state.get("constancia_fiscal_entregada", False)
         }
         
         return conversation_state
@@ -384,20 +396,19 @@ class CosmosDBStateStore(ConversationStateStore):
         
         # Campos a monitorear para cambios
         fields_to_check = [
-            "nombre", "apellido", "tipo_maquinaria", "detalles_maquinaria", "sitio_web",
-            "uso_empresa_o_venta", "nombre_empresa", 
-            "giro_empresa", "correo", "telefono", "completed", 
-            "lugar_requerimiento", "asignado_asesor"
+            "nombre", "apellido", "tipo_ayuda", "tipo_maquinaria", "detalles_maquinaria",
+            "maquina_seleccionada", "maquinas_recomendadas", "tipo_cliente", "nombre_empresa", 
+            "giro_empresa", "correo", "telefono", "completed", "cotizacion_enviada",
+            "lugar_requerimiento", "asignado_asesor", "quiere_cotizacion",
+            "constancia_fiscal_entregada"
         ]
         
         for field in fields_to_check:
             old_value = old_state.get(field)
             new_value = new_state.get(field)
             
-            # Convertir MaquinariaType a string para comparación
-            if field == "tipo_maquinaria":
-                old_value = old_value.value if old_value else None
-                new_value = new_value.value if new_value else None
+            # Comparacion directa de strings para tipo_maquinaria
+            pass
             
             if old_value != new_value:
                 changes[field] = new_value
@@ -460,9 +471,8 @@ class CosmosDBStateStore(ConversationStateStore):
             patch_ops = []
             
             for field_name, new_value in field_changes.items():
-                # Convertir MaquinariaType a string para JSON
-                if field_name == "tipo_maquinaria" and new_value:
-                    new_value = new_value.value if hasattr(new_value, 'value') else new_value
+                # No es necesaria la conversion de MaquinariaType
+                pass
                 
                 patch_ops.append({
                     "op": "replace",

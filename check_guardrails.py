@@ -59,7 +59,7 @@ class ContentSafetyGuardrails:
 
             categories = response["categoriesAnalysis"]
             for category in categories:
-                if category["severity"] > 1:
+                if category["severity"] > 3:
                     return True
             return False
 
@@ -86,10 +86,12 @@ class ContentSafetyGuardrails:
             endpoint = self.endpoint
             api_version = self.api_version
 
-            # No es necesario pasar un user prompt, solo se detecta desde los documentos
-            user_prompt = ""
-            # Detecta mejor cuando el mensaje va desde los documentos
-            documents = [message]
+            # El mensaje del usuario se pasa como userPrompt para detectar ataques
+            # directos (jailbreak). El campo 'documents' es para detectar ataques
+            # indirectos en contenido externo (PDFs, emails, etc.) y genera falsos
+            # positivos cuando se usa con mensajes normales del usuario.
+            user_prompt = message
+            documents = []
 
             # Endpoint para el API de Content Safety de Shield Prompt
             response = requests.post(
@@ -107,7 +109,7 @@ class ContentSafetyGuardrails:
             # Handle the API response
             if response.status_code == 200:
                 result = response.json()
-                if result["documentsAnalysis"][0]["attackDetected"]:
+                if result["userPromptAnalysis"]["attackDetected"]:
                     return True
                 return False
             else:
@@ -164,9 +166,19 @@ class ContentSafetyGuardrails:
             # Verificar seguridad de contenido
             content_safety_result = self.check_content_safety(message)
             logging.info(f"Verificando seguridad de contenido: {content_safety_result}")
-
-            # Check allowlist for machinery terms that trigger false positives
-            allowed_terms = ["motobomba", "cortadora", "bomba", "corte"]
+            
+            # Check allowlist for machinery/business terms that trigger false positives
+            allowed_terms = [
+                "motobomba", "cortadora", "bomba", "corte", "tijera",
+                "soldadora", "soldadoras", "soldar", "soldadura",
+                "cotiza", "cotizame", "cotización", "cotizacion", "coticemos",
+                "generador", "compresor", "plataforma", "montacargas",
+                "torre", "iluminación", "iluminacion", "rompedor", "martillo",
+                "dobladora", "apisonador", "manipulador",
+                "diesel", "diésel", "gasolina", "combustible", "eléctrica", "electrica",
+                "maquinaria", "maquina", "máquina", "equipo",
+                "prefiero", "quiero", "necesito", "primera", "segunda", "tercera"
+            ]
             is_allowed = any(term in message.lower() for term in allowed_terms)
 
             if content_safety_result:
@@ -249,7 +261,6 @@ if __name__ == "__main__":
         # Información de contacto
         "Mi correo es juan@empresa.com",
         "Mi teléfono es 555-1234",
-        "No tenemos página web",
         "Solo tenemos Facebook",
         # Preguntas técnicas específicas
         "¿Qué tipo de electrodo usa esa soldadora?",
@@ -262,7 +273,6 @@ if __name__ == "__main__":
         "Exacto, es para construcción",
         "Sí, es para uso interno",
         # Respuestas negativas válidas
-        "No tengo página web",
         "No estoy seguro del amperaje",
         "Aún no he decidido el modelo",
         "No tengo empresa, soy particular",

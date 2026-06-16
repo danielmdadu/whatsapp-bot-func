@@ -12,7 +12,7 @@ WHATSAPP_ACCESS_TOKEN
 PHONE_NUMBER_ID
 WHATSAPP_API_VERSION
 
-# AI FOUNDRY
+# AI FOUNDRY (Azure OpenAI)
 FOUNDRY_ENDPOINT
 FOUNDRY_API_KEY
 
@@ -20,186 +20,113 @@ FOUNDRY_API_KEY
 COSMOS_CONNECTION_STRING
 COSMOS_DB_NAME
 COSMOS_CONTAINER_NAME
+
+# HUBSPOT
+HUBSPOT_ACCESS_TOKEN
 ```
 
 ## Descripción del Proyecto
 
-Este proyecto implementa un chatbot inteligente automatizado para la calificación de leads de maquinaria ligera, integrando WhatsApp Business API con Azure OpenAI GPT-4.1-mini y LangChain. El sistema está diseñado como una Azure Function que procesa webhooks de WhatsApp y gestiona conversaciones de manera inteligente para recopilar información de clientes potenciales.
+Este proyecto implementa un chatbot inteligente automatizado para la calificación de leads de maquinaria ligera, integrando WhatsApp Business API con Azure OpenAI GPT-4.1-mini y LangChain. El sistema está diseñado como una Azure Function que procesa webhooks de WhatsApp y gestiona conversaciones de manera inteligente para recopilar información de clientes potenciales, consultar inventario y sincronizar datos con HubSpot.
 
 ## Características Principales
 
 ### 🤖 **Inteligencia Artificial Avanzada**
-- **Motor de IA**: Azure OpenAI GPT-4.1-mini con LangChain
-- **Slot-filling inteligente**: Extrae automáticamente información de los mensajes de los usuarios
-- **Respuestas contextuales**: Genera respuestas naturales y conversacionales
-- **Detección de intención**: Identifica preguntas sobre inventario vs. información personal
+- **Motor de IA**: Azure OpenAI GPT-4.1-mini con LangChain.
+- **Slot-filling Inteligente**: Implementado mediante `IntelligentSlotFiller`, detecta automáticamente información en los mensajes del usuario, evitando preguntas redundantes.
+- **Detección de Respuestas Negativas**: Capacidad de entender cuando un usuario indica que "no tiene" o "no sabe" un dato específico.
+- **Respuestas Contextuales**: Genera respuestas naturales adaptadas al flujo de la conversación y al estado actual del lead.
+- **Generación Dinámica de Prompts**: Los prompts se construyen dinámicamente basándose en la configuración de la maquinaria (`maquinaria_config.py`).
+
+### 🏭 **Gestión Dinámica de Inventario**
+- **Configuración Centralizada**: Definición de tipos de maquinaria y sus campos requeridos en `maquinaria_config.py` (respaldado por Cosmos DB).
+- **Recomendaciones Inteligentes**: Sistema que compara los requerimientos del usuario con el inventario disponible (`inventory_data.py`) para sugerir modelos específicos.
+- **Respuesta a Dudas de Inventario**: Módulo dedicado (`InventoryResponder`) para resolver dudas sobre disponibilidad y características técnicas.
 
 ### 📱 **Integración con WhatsApp**
-- **Webhook de WhatsApp**: Conectado directamente a la API de WhatsApp Business
-- **Procesamiento en tiempo real**: Maneja mensajes entrantes y salientes automáticamente
-- **Verificación de usuarios**: Sistema de autorización para usuarios específicos
-- **Normalización de números**: Manejo inteligente de números telefónicos mexicanos
+- **Webhook de WhatsApp**: Conectado directamente a la API de WhatsApp Business.
+- **Procesamiento en tiempo real**: Manejo eficiente de mensajes entrantes y salientes.
+- **Soporte Multimedia**: Estructura lista para procesar imágenes, videos y documentos.
+- **Normalización de números**: Manejo estándar de números telefónicos mexicanos.
 
 ### 🛡️ **Sistema de Guardrails de Seguridad**
-- **Detección de inyección de código**: Previene ataques SQL, Python y XSS
-- **Análisis de contenido**: Azure Content Safety para detectar contenido inapropiado
-- **Protección contra ataques de groundness**: Detecta intentos de manipulación del bot
-- **Clasificación de conversación**: Filtra mensajes fuera del dominio de maquinaria
-- **Timeouts de seguridad**: Protección contra ataques de denegación de servicio
+- **Detección de inyección de código**: Previene ataques SQL, Python y XSS.
+- **Análisis de contenido**: Azure Content Safety para detectar contenido inapropiado (Hate, SelfHarm, Sexual, Violence).
+- **Protección contra ataques de groundness**: Detecta intentos de manipulación del comportamiento del bot (Jailbreaks).
+- **Clasificación de conversación**: Filtra mensajes fuera del dominio de maquinaria.
 
-### 💾 **Gestión de Datos**
-- **Base de datos Cosmos DB**: Almacenamiento persistente y escalable de conversaciones
-- **Integración con HubSpot**: Sincronización automática de leads con CRM
-- **Estado de conversación**: Gestión inteligente del estado de cada usuario
-- **Operaciones optimizadas**: Actualizaciones granulares para mejor rendimiento
-
-### 🔄 **Gestión de Conversaciones**
-- **Modo dual**: Bot automático y modo agente humano
-- **Timeout de agente**: Regreso automático al bot después de 30 minutos de inactividad
-- **Comandos especiales**: Reset y status para administración
-- **Prevención de duplicados**: Detección y filtrado de mensajes duplicados
+### 💾 **Gestión de Datos y CRM**
+- **Azure Cosmos DB**: Almacenamiento persistente del estado de las conversaciones y configuración de maquinaria.
+- **HubSpot Integration**: Sincronización automática de leads y actualización de contactos en CRM.
+- **Estado de Conversación**: Modelo robusto que persiste el progreso del usuario entre mensajes.
 
 ## Funcionalidades del Bot
 
 ### 📋 **Calificación Automática de Leads**
-El bot recopila sistemáticamente la siguiente información:
+El bot recopila sistemáticamente:
 
-1. **Información Personal**
-   - Nombre y apellido del cliente
-   - Información de contacto (teléfono, correo electrónico)
-
-2. **Información Empresarial**
-   - Nombre de la empresa
-   - Giro o actividad de la empresa
-   - Sitio web (opcional)
-   - Tipo de uso (empresa o venta)
-
-3. **Requerimientos Técnicos**
-   - Tipo de maquinaria necesaria
-   - Detalles específicos según el tipo de equipo
-   - Ubicación del requerimiento
+1. **Información Personal**: Nombre, Apellido, Teléfono, Correo.
+2. **Información Empresarial**: Nombre de la empresa, Giro/Actividad, Lugar del requerimiento, Tipo de uso (Empresa/Venta).
+3. **Requerimientos Técnicos**: Tipo de maquinaria y especificaciones técnicas precisas.
 
 ### 🔧 **Tipos de Maquinaria Soportados**
-- **Soldadoras**: Amperaje y tipo de electrodo
-- **Compresores**: Capacidad de volumen y herramientas a conectar
-- **Torres de iluminación**: Preferencia LED
-- **Plataformas de elevación**: Altura, actividad y ubicación
-- **Generadores**: Actividad y capacidad en kVA/kW
-- **Rompedores**: Uso y tipo (eléctrico/neumático)
-- **Apisonadores**: Uso, tipo de motor y diafragma
-- **Montacargas**: Capacidad, energía, posición del operador y altura
-- **Manipuladores**: Capacidad, altura, actividad y tipo de energía
-
-### 🎯 **Respuestas Inteligentes**
-- **Preguntas sobre inventario**: Información automática sobre productos disponibles
-- **Extracción de información**: Detección inteligente de datos en mensajes naturales
-- **Respuestas negativas**: Manejo de "no tengo" o "no especificado"
-- **Contexto conversacional**: Considera la última pregunta del bot para mejor interpretación
+La configuración es dinámica, pero actualmente soporta:
+- **Soldadoras**: Amperaje, tipo de alimentación (eléctrica/combustible).
+- **Compresores**: Caudal (CFM), Presión (PSI).
+- **Generadores**: Potencia (kW), Tipo (Estacionario/Portátil).
+- **Torres de iluminación**: Tipo de reflector (LED), Autonomía.
+- **Plataformas de elevación**: Altura de trabajo, Tipo (Tijera/Articulada).
+- **Montacargas**: Capacidad de carga, Altura máxima.
+- **Manipuladores**: Alcance, Capacidad.
+- **Rompedores, Apisonadores, Motobombas, Cortadoras/Dobladoras de Varilla**.
 
 ## Arquitectura Técnica
 
 ### 🏗️ **Componentes Principales**
 
-1. **`function_app.py`**: Punto de entrada de Azure Functions
-   - Manejo de webhooks de WhatsApp
-   - Verificación de tokens
-   - Procesamiento de mensajes
+1. **`function_app.py`**: Entry point de Azure Function. Maneja el webhook, `check_agent_timeout` y endpoints auxiliares (`agent-message`, `start-bot-mode`).
+2. **`whatsapp_bot.py`**: Controlador principal del flujo de WhatsApp. Orquesta la interacción entre el usuario y el cerebro de IA.
+3. **`ai_langchain.py`**: Cerebro del bot. Contiene:
+    - `IntelligentSlotFiller`: Extrae datos del texto.
+    - `IntelligentResponseGenerator`: Crea las respuestas al usuario.
+    - `InventoryResponder`: Atiende preguntas directas sobre productos.
+4. **`maquinaria_config.py`**: Gestiona la configuración de los equipos (campos, preguntas, validaciones). Soporta carga desde Cosmos DB o fallback local.
+5. **`inventory_service.py`** & **`inventory_data.py`**: Lógica de búsqueda y filtrado de productos y base de datos local de productos.
+6. **`state_management.py`**: Capa de persistencia (InMemory para dev, Cosmos DB para prod).
+7. **`check_guardrails.py`**: Capa de seguridad y filtrado de contenido.
+8. **`test_chatbot.py`**: Suite de pruebas para simular conversaciones y validar flujos.
 
-2. **`whatsapp_bot.py`**: Lógica del bot de WhatsApp
-   - Envío y recepción de mensajes
-   - Integración con guardrails
-   - Gestión de comandos especiales
+## Testing
 
-3. **`ai_langchain.py`**: Motor de IA y procesamiento de lenguaje
-   - Slot-filling inteligente
-   - Generación de respuestas contextuales
-   - Detección de preguntas sobre inventario
+El proyecto incluye un script robusto para probar flujos de conversación sin necesidad de usar WhatsApp real.
 
-4. **`state_management.py`**: Gestión de estado y persistencia
-   - Almacenamiento en Cosmos DB
-   - Operaciones optimizadas
-   - Modelos de datos
+### 🧪 **Ejecución de Pruebas**
 
-5. **`hubspot_manager.py`**: Integración con CRM
-   - Creación y actualización de contactos
-   - Sincronización de datos
-   - Mapeo de campos
+Para ejecutar las pruebas automatizadas de los flujos definidos:
+```bash
+python test_chatbot.py
+```
+Esto ejecutará escenarios predefinidos (Usuario directo, Usuario con múltiples datos, Usuario indeciso, etc.) y generará reportes en la carpeta `test_results`.
 
-6. **`check_guardrails.py`**: Sistema de seguridad
-   - Múltiples capas de protección
-   - Análisis de contenido
-   - Detección de ataques
-
-### 🔧 **Tecnologías Utilizadas**
-- **Azure Functions**: Solución sin servidor para procesamiento
-- **Azure OpenAI**: GPT-4.1-mini para procesamiento de lenguaje natural
-- **LangChain**: Framework para aplicaciones de IA
-- **Azure Cosmos DB**: Base de datos NoSQL para persistencia
-- **HubSpot API**: CRM para gestión de leads
-- **WhatsApp Business API**: Comunicación con usuarios
-- **Azure Content Safety**: Análisis de seguridad de contenido
+Para probar manualmente en consola interactiva (chat en terminal):
+1. Abrir `test_chatbot.py`.
+2. Asegurar que `test_manually(chatbot_instance)` esté descomentado en el bloque `if __name__ == "__main__":`.
+3. Ejecutar el script y chatear con el bot en la terminal.
 
 ## Configuración y Despliegue
 
-### 📝 **Variables de Entorno Requeridas**
-```bash
-# WhatsApp
-WHATSAPP_ACCESS_TOKEN=your_token
-PHONE_NUMBER_ID=your_phone_id
-WHATSAPP_API_VERSION=your_version
-VERIFY_TOKEN=your_verify_token
+### 🚀 **Instalación Local**
+1. Clonar el repositorio.
+2. Crear entorno virtual: `python -m venv .venv`.
+3. Activar entorno: `source .venv/bin/activate` (Mac/Linux) o `.venv\Scripts\activate` (Windows).
+4. Instalar dependencias: `pip install -r requirements.txt`.
+5. Crear archivo `.env` o `local.settings.json` con las variables de entorno.
+6. Ejecutar localmente: `func start`.
 
-# Azure OpenAI
-FOUNDRY_ENDPOINT=your_endpoint
-FOUNDRY_API_KEY=your_api_key
-
-# Cosmos DB
-COSMOS_CONNECTION_STRING=your_connection_string
-COSMOS_DB_NAME=your_database_name
-COSMOS_CONTAINER_NAME=your_container_name
-
-# HubSpot
-HUBSPOT_ACCESS_TOKEN=your_hubspot_token
-
-# Usuarios autorizados
-RECIPIENT_WAID=authorized_user_id
-RECIPIENT_WAID_2=authorized_user_id_2
-RECIPIENT_WAID_3=authorized_user_id_3
-```
-
-### 🚀 **Instalación**
-1. Clonar el repositorio
-2. Instalar dependencias: `pip install -r requirements.txt`
-3. Configurar variables de entorno
-4. Desplegar en Azure Functions
-
-## Flujo de Trabajo
-
-1. **Recepción de Mensaje**: WhatsApp envía webhook a Azure Function
-2. **Verificación de Seguridad**: Guardrails analizan el mensaje
-3. **Procesamiento de IA**: LangChain extrae información y genera respuesta
-4. **Actualización de Estado**: Cosmos DB almacena la conversación
-5. **Sincronización CRM**: HubSpot actualiza el contacto del lead
-6. **Respuesta**: Bot envía respuesta contextual por WhatsApp
-
-## Características de Seguridad
-
-- **Múltiples capas de protección** contra ataques maliciosos
-- **Análisis de contenido** en tiempo real
-- **Detección de inyección de código** mediante patrones regex
-- **Protección contra manipulación** del comportamiento del bot
-- **Filtrado de contenido** fuera del dominio de maquinaria
-- **Timeouts de seguridad** para prevenir ataques de denegación de servicio
-
-## Monitoreo y Logs
-
-El sistema incluye logging detallado para:
-- Procesamiento de mensajes
-- Errores de seguridad
-- Operaciones de base de datos
-- Integración con HubSpot
-- Rendimiento de la IA
+### ☁️ **Despliegue en Azure**
+1. Asegurar tener los recursos creados (Function App, Cosmos DB, Azure OpenAI).
+2. Configurar las variables de entorno en la Function App "Configuration".
+3. Desplegar: `func azure functionapp publish <APP_NAME>`.
 
 ## Contribución
-
-Este proyecto está diseñado para ser escalable y mantenible, con una arquitectura modular que permite fácil extensión de funcionalidades y mejoras en el procesamiento de lenguaje natural.
+El código sigue una arquitectura modular. Para agregar un nuevo tipo de maquinaria, actualice `maquinaria_config.py` y `inventory_data.py`. Para mejorar la IA, revise los prompts en `ai_prompts.py`.

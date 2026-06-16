@@ -18,7 +18,7 @@ from check_guardrails import ContentSafetyGuardrails
 # ============================================================================
 
 class WhatsAppBot:
-    def __init__(self, state_store: Optional[ConversationStateStore] = None):
+    def __init__(self, state_store: Optional[ConversationStateStore] = None, cosmos_client: Any = None, db_name: str = None):
         self.access_token = os.environ['WHATSAPP_ACCESS_TOKEN']
         self.phone_number_id = os.environ['PHONE_NUMBER_ID']
         self.version = os.environ['WHATSAPP_API_VERSION']
@@ -29,13 +29,21 @@ class WhatsAppBot:
         
         # Usar el state_store proporcionado
         self.state_store = state_store
+        
+        # Cliente Cosmos para servicios que lo requieran
+        self.cosmos_client = cosmos_client
+        self.db_name = db_name
 
         # Una sola instancia del chatbot que manejará todos los usuarios
         # Pasar callback de envío de mensajes para que el chatbot pueda enviar directamente
+        # Pasar cliente cosmos para servicios internos
         self.chatbot = IntelligentLeadQualificationChatbot(
             self.langchain_config, 
             self.state_store,
-            send_message_callback=self.send_message
+            send_message_callback=self.send_message,
+            send_pdf_callback=self.send_pdf_quotation,
+            cosmos_client=self.cosmos_client,
+            db_name=self.db_name
         )
 
         # Una sola instancia del guardrails
@@ -73,7 +81,7 @@ class WhatsAppBot:
         lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
 
         if template_name == "notificacion_de_leads":
-            return f"Hola {lead_name}, mi nombre es Alejandro Gómez asesor comercial de Alpha C. Me pongo en contacto contigo para dar seguimiento a tu interés en la siguiente maquinaria: {lead_machine_type}. Para continuar con tu solicitud, ¿me podrías confirmar si la maquinaria la requieres para venta o uso propio?"
+            return f"Hola {lead_name}, mi nombre es Alphi, asesor comercial de Alpha C. Me pongo en contacto contigo para dar seguimiento a tu interés en la siguiente maquinaria: {lead_machine_type}. Para continuar con tu solicitud, ¿me podrías confirmar si la maquinaria la requieres para venta o uso propio?"
         elif template_name == "seguimiento_conversacion":
             return f"""Hola {lead_name}, intentamos comunicarnos contigo para brindarte la información del equipo que solicitaste.
             ¿Sigues interesado en recibir la información o una cotización?
@@ -135,10 +143,17 @@ class WhatsAppBot:
                 "id": content
             }
         elif message_type == "document":
-            payload["document"] = {
-                "id": content,
-                "filename": "archivo"
-            }
+            # content can be media_id string or dict with id+filename
+            if isinstance(content, dict):
+                payload["document"] = {
+                    "id": content["id"],
+                    "filename": content.get("filename", "archivo")
+                }
+            else:
+                payload["document"] = {
+                    "id": content,
+                    "filename": "archivo"
+                }
         elif message_type == "template":
             payload["template"] = {
                 "name": content,
@@ -183,14 +198,84 @@ class WhatsAppBot:
             logging.error(f"Error enviando mensaje a {wa_id}: {e}")
             return None
     
+    def upload_media(self, file_bytes: bytes, mime_type: str, filename: str) -> Optional[str]:
+        """
+        Uploads a file to the WhatsApp Media API.
+        Returns the media_id on success, None on failure.
+        """
+        try:
+            url = f"https://graph.facebook.com/{self.version}/{self.phone_number_id}/media"
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+            }
+            files = {
+                "file": (filename, file_bytes, mime_type),
+            }
+            data = {
+                "messaging_product": "whatsapp",
+                "type": mime_type,
+            }
+            
+            response = requests.post(url, headers=headers, files=files, data=data, timeout=30)
+            response.raise_for_status()
+            
+            media_id = response.json().get("id")
+            logging.info(f"[PDF] Media uploaded successfully. media_id: {media_id}")
+            return media_id
+            
+        except Exception as e:
+            logging.error(f"[PDF] Error uploading media: {e}")
+            return None
+
+    def send_pdf_quotation(self, wa_id: str, pdf_bytes: bytes, filename: str) -> Optional[str]:
+        """
+        Uploads a PDF and sends it as a WhatsApp document message.
+        Returns the WhatsApp message ID on success, None on failure.
+        """
+        try:
+            # 1. Upload PDF to WhatsApp Media API
+            media_id = self.upload_media(pdf_bytes, "application/pdf", filename)
+            if not media_id:
+                logging.error(f"[PDF] Failed to upload PDF for {wa_id}")
+                return None
+            
+            # 2. Send as document message using existing infrastructure
+            document_content = {
+                "id": media_id,
+                "filename": filename
+            }
+            normalized_recipient = self.normalize_mexican_number(wa_id)
+            payload = {
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": normalized_recipient,
+                "type": "document",
+                "document": document_content
+            }
+            
+            headers = {
+                "Content-type": "application/json",
+                "Authorization": f"Bearer {self.access_token}",
+            }
+            
+            url = f"https://graph.facebook.com/{self.version}/{self.phone_number_id}/messages"
+            response = requests.post(url, data=json.dumps(payload), headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            whatsapp_message_id = response.json()["messages"][0]["id"]
+            logging.info(f"[PDF] Quotation PDF sent to {wa_id}. message_id: {whatsapp_message_id}")
+            return whatsapp_message_id
+            
+        except Exception as e:
+            logging.error(f"[PDF] Error sending PDF to {wa_id}: {e}")
+            return None
+    
     def process_message(self, wa_id: str, message_text: str, whatsapp_message_id: str, hubspot_manager: HubSpotManager) -> None:
         """
         Procesa un mensaje entrante usando LangChain.
         El chatbot ahora envía automáticamente las respuestas por WhatsApp.
         """
         try:
-            # Desactivamos los comandos
-            """
             # Verificar si es un comando especial
             if message_text.lower() == "reset":
                 reset_response = self._handle_reset_command(wa_id, hubspot_manager)
@@ -202,7 +287,6 @@ class WhatsAppBot:
                 # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
                 self.send_message(wa_id, status_response)
                 return
-            """
 
             # Verificar si el mensaje es seguro
             safety_result = self.guardrails.check_message_safety(message_text)
@@ -237,11 +321,23 @@ class WhatsAppBot:
     def process_multimedia_msg(self, wa_id: str, multimedia: Dict[str, Any], whatsapp_message_id: str) -> None:
         """
         Procesa un mensaje multimedia entrante.
-        Actualmente solo responde que no se soportan mensajes multimedia.
+        Registra el mensaje e invoca al LLM enviando un texto simulado.
         """
         try:
             logging.info(f"Mensaje multimedia recibido de {wa_id}. Tipo: " + multimedia.get('type') + ".")
             self.state_store.add_single_message(wa_id, multimedia, whatsapp_message_id, self.chatbot.state)
+            
+            # Generar texto descriptivo para el modelo
+            msg_type = multimedia.get('type', 'documento')
+            if msg_type == "document":
+                # Usar esta frase específica para ayudar a que la extracción comprenda que llegó la constancia
+                simulated_text = "Aquí está el archivo PDF adjunto."
+            else:
+                simulated_text = f"[Archivo {msg_type} adjunto recibido]"
+                
+            # Procesar el mensaje con LangChain para generar la respuesta correspondiente
+            self.chatbot.send_message(simulated_text, whatsapp_message_id, hubspot_manager=None)
+            
         except Exception as e:
             logging.error(f"Error procesando mensaje multimedia: {e}")
 
@@ -268,8 +364,12 @@ class WhatsAppBot:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_3'])
             if "RECIPIENT_WAID_4" in os.environ:
                 authorized_ids.append(os.environ['RECIPIENT_WAID_4'])
-
-            return wa_id in authorized_ids or True # Allow all the recipients
+            if "RECIPIENT_WAID_5" in os.environ:
+                authorized_ids.append(os.environ['RECIPIENT_WAID_5'])
+            if "RECIPIENT_WAID_6" in os.environ:
+                authorized_ids.append(os.environ['RECIPIENT_WAID_6'])
+                
+            return wa_id in authorized_ids or True
         except Exception as e:
             logging.error(f"Error verificando si el usuario {wa_id} está autorizado: {e}")
             return False
@@ -310,25 +410,7 @@ class WhatsAppBot:
         """Obtiene el estado actual de la conversación del usuario."""
         try:
             self.chatbot.load_conversation(wa_id)
-            state = self.chatbot.state
-            return f"""📊 ESTADO DE CONVERSACIÓN:
-        🤖 API: LangChain (IntelligentLeadQualificationChatbot)
-        👤 Usuario: {wa_id}
-        ✅ Completada: {'Sí' if state.get('completed', False) else 'No'}
-        📝 Nombre: {state.get('nombre', 'No especificado')}
-        👤 Apellido: {state.get('apellido', 'No especificado')}
-        🔧 Tipo maquinaria: {state.get('tipo_maquinaria', 'No especificado')}
-        🔍 Detalles maquinaria: {state.get('detalles_maquinaria', 'No especificado')}
-        💼 Nombre empresa: {state.get('nombre_empresa', 'No especificado')}
-        💼 Giro empresa: {state.get('giro_empresa', 'No especificado')}
-        🌐 Sitio web: {state.get('sitio_web', 'No especificado')}
-        💼 Tipo de uso: {state.get('uso_empresa_o_venta', 'No especificado')}
-        📧 Correo: {state.get('correo', 'No especificado')}
-        📱 Teléfono: {state.get('telefono', 'No especificado')}
-        📍 Lugar requerimiento: {state.get('lugar_requerimiento', 'No especificado')}
-        💬 Total mensajes: {len(state.get('messages', []))}
-        👤 Conversación mode: {state.get('conversation_mode', 'No especificado')}
-        """
+            return self.chatbot.get_status_message()
         except Exception as e:
             logging.error(f"Error obteniendo estado de conversación: {e}")
             return f"❌ Error obteniendo estado: {str(e)}"

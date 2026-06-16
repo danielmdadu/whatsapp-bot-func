@@ -8,7 +8,25 @@ test
 .venv
 .cursorignore
 test.http
-test_chatbot.py
-test_results/
 .env
 ARQUITECTURA_CHATBOT.md
+pytest.ini
+
+# Python cache
+__pycache__
+*.pyc
+.pytest_cache
+
+# Tests and scripts
+test_chatbot.py
+test_inventory_integration.py
+test_inventory_match_specifications.py
+test_main_endpoint.py
+test_pricing_service.py
+test_pdf_service.py
+
+# Directories (without trailing slash to ensure VS Code ignores them properly)
+test_results
+
+# Flujo de conversación
+flujo_conversacion.puml

@@ -20,6 +20,16 @@ pydantic
 # Cosmos DB
 azure-cosmos
 
+# Azure Blob Storage (fichas técnicas)
+azure-storage-blob
+
 # Azure Content Safety
 azure-ai-contentsafety
 azure-ai-inference
+python-dotenv
+
+# SQL Server connectivity
+pyodbc
+
+# PDF generation
+fpdf2

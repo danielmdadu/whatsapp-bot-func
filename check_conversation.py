@@ -3,7 +3,7 @@ import json
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import SystemMessage, UserMessage
 from azure.core.credentials import AzureKeyCredential
-from state_management import MaquinariaType
+from maquinaria_config import machinery_config_service
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 
@@ -26,7 +26,8 @@ def clasificar_mensaje(message: str) -> str:
             api_version="2024-05-01-preview"
         )   
 
-        maquinaria_types = [maquinaria_type.value for maquinaria_type in MaquinariaType]
+        # Obtener tipos de maquinaria dinámicamente
+        maquinaria_types = [m.type_id for m in machinery_config_service.get_all_types()]
 
         system_prompt = (
             "Eres un clasificador de intenciones para un chatbot de ventas de maquinaria.\n\n"
@@ -34,7 +35,9 @@ def clasificar_mensaje(message: str) -> str:
             
             "1. VALIDO - Incluye CUALQUIER consulta con las siguientes características:\n"
             "   - Preguntas sobre tipos de maquinaria:" + ", ".join(maquinaria_types) + "\n"
+            "   - Preguntas sobre refacciones de maquinaria\n"
             "   - Consultas sobre PRECIOS de maquinaria específica\n"
+            "   - Consultas sobre créditos de maquinaria o financiamiento\n"
             "   - Preguntas sobre disponibilidad de inventario\n"
             "   - Preguntas sobre características y especificaciones\n"
             "   - Consultas sobre marcas de maquinaria\n"
@@ -43,7 +46,10 @@ def clasificar_mensaje(message: str) -> str:
             "   - Información personal del cliente (nombre, empresa, contacto, lugar de requerimiento)\n"
             "   - Preguntas sobre por qué necesita ciertos datos\n"
             "   - Preguntas sobre cómo se llama el asistente\n"
-            "   - Detalles sobre proyectos que requieren maquinaria\n\n"
+            "   - Detalles sobre proyectos que requieren maquinaria\n"
+            "   - Respuestas cortas sobre el giro o actividad de la empresa del cliente (ej: 'mantenimiento', 'construcción', 'minería', 'renta de maquinaria')\n"
+            "   - Respuestas sobre si el equipo es para uso propio, venta o renta (ej: 'no, es para uso propio', 'sí, rentamos maquinaria')\n"
+            "   - Respuestas de selección cuando el usuario elige entre opciones presentadas (ej: 'la segunda', 'me interesa el primero', 'quiero la opción 3')\n\n"
             
             "2. COMPETENCIA_PROHIBIDO - Consultas sobre otros proveedores:\n"
             "   - Preguntas sobre precios de competidores\n"
@@ -60,6 +66,23 @@ def clasificar_mensaje(message: str) -> str:
             "EJEMPLOS IMPORTANTES:\n"
             "- '¿Cuál es el precio de la soldadora Shindaiwa?' → valido\n"
             "- 'Lo necesito de 20 litros' → valido\n"
+            "- 'Me interesa la segunda opción' → valido\n"
+            "- 'Quiero el primero' → valido\n"
+            "- 'quiero la segunda' → valido (selección de opción presentada)\n"
+            "- 'quiero la primera' → valido (selección de opción presentada)\n"
+            "- 'la primera opción' → valido (selección de opción presentada)\n"
+            "- 'si, la segunda' → valido (selección de opción presentada)\n"
+            "- 'la 1' → valido (selección de opción presentada)\n"
+            "- 'la 2' → valido (selección de opción presentada)\n"
+            "- 'no, nos dedicamos al mantenimiento' → valido (respuesta sobre giro de empresa)\n"
+            "- 'nos dedicamos a la construcción' → valido (respuesta sobre giro de empresa)\n"
+            "- 'no, es para uso propio' → valido (respuesta sobre tipo de uso)\n"
+            "- 'sí, rentamos maquinaria' → valido (respuesta sobre tipo de cliente)\n"
+            "- 'no me dedico a eso' → valido (respuesta sobre tipo de cliente)\n"
+            "- 'mantenimiento' → valido (respuesta sobre giro de empresa)\n"
+            "- 'minería' → valido (respuesta sobre giro de empresa)\n"
+            "- 'uso propio' → valido (respuesta sobre tipo de uso)\n"
+            "- 'cliente_final' → valido (respuesta sobre tipo de cliente)\n"
             "- '¿Cuál es la capital de México?' → fuera_de_dominio\n"
             "- 'Dame precios de otros proveedores' → competencia_prohibido\n\n"
             
@@ -81,13 +104,28 @@ def clasificar_mensaje(message: str) -> str:
 
         raw_output = response.choices[0].message.content.strip()
         
-        # Buscar el inicio del JSON en la respuesta
+        # Remove markdown code blocks if present
+        if "```json" in raw_output:
+            raw_output = raw_output.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_output:
+            raw_output = raw_output.split("```")[1].split("```")[0].strip()
+        
+        # Find the first complete JSON object
         json_start = raw_output.find('{')
         if json_start != -1:
-            # Extraer solo la parte del JSON
+            # Extract only the first JSON object
             raw_output = raw_output[json_start:]
-            # Buscar el final del JSON
-            json_end = raw_output.rfind('}') + 1
+            # Find the matching closing brace for the first object
+            brace_count = 0
+            json_end = 0
+            for i, char in enumerate(raw_output):
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
             if json_end > 0:
                 raw_output = raw_output[:json_end]
 
@@ -150,7 +188,6 @@ if __name__ == "__main__":
         # Información de contacto
         "Mi correo es juan@empresa.com",
         "Mi teléfono es 555-1234",
-        "No tenemos página web",
         "Solo tenemos Facebook",
         # Preguntas técnicas específicas
         "¿Qué tipo de electrodo usa esa soldadora?",
@@ -165,7 +202,6 @@ if __name__ == "__main__":
     ]
     mensajes_valido_group3 = [
         # Respuestas negativas válidas
-        "No tengo página web",
         "No estoy seguro del amperaje",
         "Aún no he decidido el modelo",
         "No tengo empresa, soy particular",
