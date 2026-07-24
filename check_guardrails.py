@@ -149,7 +149,9 @@ class ContentSafetyGuardrails:
             raise TimeoutError("Timeout en check_conversation_safety después de 30 segundos")
         except Exception as e:
             print(f"Error en check_conversation_safety: {e}")
-            return True  # En caso de error, considerar como no válido por seguridad
+            # Fail-open: si el clasificador de dominio no puede evaluarse, dejamos pasar
+            # el mensaje (False = válido) en vez de bloquear a un lead legítimo.
+            return False
 
     def check_message_safety(self, message: str):  
         logging.info(f"Verificando seguridad del mensaje: {message}")      

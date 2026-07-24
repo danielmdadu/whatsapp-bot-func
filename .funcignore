@@ -30,3 +30,5 @@ test_results
 
 # Flujo de conversación
 flujo_conversacion.puml
+
+real_conversations_withLeads/

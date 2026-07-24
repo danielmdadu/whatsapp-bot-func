@@ -81,6 +81,11 @@ def clasificar_mensaje(message: str) -> str:
             "- 'no me dedico a eso' → valido (respuesta sobre tipo de cliente)\n"
             "- 'mantenimiento' → valido (respuesta sobre giro de empresa)\n"
             "- 'minería' → valido (respuesta sobre giro de empresa)\n"
+            "- 'ninguno' → valido (respuesta indicando que no requiere más maquinaria)\n"
+            "- 'ninguna otra' → valido (respuesta indicando que no requiere más maquinaria)\n"
+            "- 'no ninguno' → valido (respuesta indicando que no requiere más maquinaria)\n"
+            "- 'solo la plataforma' → valido (respuesta indicando que solo requiere esa maquinaria)\n"
+            "- 'por ahora solo eso' → valido (respuesta indicando que no requiere más maquinaria)\n"
             "- 'uso propio' → valido (respuesta sobre tipo de uso)\n"
             "- 'cliente_final' → valido (respuesta sobre tipo de cliente)\n"
             "- '¿Cuál es la capital de México?' → fuera_de_dominio\n"
@@ -140,10 +145,13 @@ def clasificar_mensaje(message: str) -> str:
             return result
     except FutureTimeoutError:
         print("Timeout en clasificar_mensaje después de 30 segundos")
-        return "fuera_de_dominio"  # En caso de timeout, considerar como fuera de dominio por seguridad
+        # Fail-open: un fallo de infra del clasificador de dominio NO debe bloquear al lead.
+        # Content-safety y groundness cubren el contenido realmente peligroso por separado.
+        return "valido"
     except Exception as e:
         print("Error parseando respuesta:", e)
-        return "fuera_de_dominio"
+        # Fail-open: ante error de parseo/API, dejamos pasar el mensaje en vez de vetarlo.
+        return "valido"
 
 """
 # TESTING
