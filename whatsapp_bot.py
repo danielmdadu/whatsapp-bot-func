@@ -289,10 +289,7 @@ class WhatsAppBot:
                 return
 
             # Verificar si el mensaje es seguro
-            # TODO: DESACTIVADO TEMPORALMENTE - reactivar al resolver el bug del guardrail.
-            # Mientras esté desactivado, todos los mensajes se envían al LLM tal cual los manda el lead.
-            # safety_result = self.guardrails.check_message_safety(message_text)
-            safety_result = None
+            safety_result = self.guardrails.check_message_safety(message_text)
             if safety_result:
                 if safety_result["type"] == "invalid_conversation" or safety_result["type"] == "content_safety":
                     message_text = "(FD) " + safety_result["message"] + " (FD) Mensaje del lead: " + message_text

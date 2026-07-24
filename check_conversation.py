@@ -1,8 +1,10 @@
 import os
 import json
+import time
 from azure.ai.inference import ChatCompletionsClient
 from azure.ai.inference.models import SystemMessage, UserMessage
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError
 from maquinaria_config import machinery_config_service
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
@@ -11,13 +13,16 @@ def clasificar_mensaje(message: str) -> str:
     """
     Clasifica un mensaje en: valido, competencia_prohibido, fuera_de_dominio.
     Devuelve la etiqueta como string.
-    Se usa el modelo Ministral-3B de Foundry porque es el más económico.
+    Se reutiliza el mismo deployment gpt-4.1-mini del bot principal (recurso Foundry
+    'ai-model-bot' en prod / 'leadsbot-resource' en pruebas, vía FOUNDRY_ENDPOINT).
+    Antes se usaba Ministral-3B, pero su deployment tenía RPM=1 y throttleaba (429)
+    en conversaciones reales, lo que corrompía los mensajes con el prefijo "(FD)".
     """
 
     def _clasificar():
         # Configuración de cliente
         endpoint = os.environ["FOUNDRY_ENDPOINT"] + "models"
-        model_name = "Ministral-3B"
+        model_name = "gpt-4.1-mini"
         api_key = os.environ["FOUNDRY_API_KEY"]
 
         client = ChatCompletionsClient(
@@ -96,16 +101,29 @@ def clasificar_mensaje(message: str) -> str:
             "No agregues texto adicional."
         )
 
-        response = client.complete(
-            messages=[
-                SystemMessage(content=system_prompt),
-                UserMessage(content=message),
-            ],
-            model=model_name,
-            temperature=0,
-            top_p=1,
-            max_tokens=100
-        )
+        # Reintento con backoff ante throttling (429). gpt-4.1-mini tiene cuota holgada,
+        # pero esto absorbe ráfagas puntuales sin caer directo al fail-open.
+        # response_format="json_object" fuerza salida JSON limpia (el prompt incluye "JSON").
+        response = None
+        for intento in range(3):
+            try:
+                response = client.complete(
+                    messages=[
+                        SystemMessage(content=system_prompt),
+                        UserMessage(content=message),
+                    ],
+                    model=model_name,
+                    temperature=0,
+                    top_p=1,
+                    max_tokens=100,
+                    response_format="json_object"
+                )
+                break
+            except HttpResponseError as e:
+                if getattr(e, "status_code", None) == 429 and intento < 2:
+                    time.sleep(1.5 * (intento + 1))
+                    continue
+                raise
 
         raw_output = response.choices[0].message.content.strip()
         
