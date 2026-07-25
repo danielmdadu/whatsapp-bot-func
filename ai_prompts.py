@@ -166,6 +166,17 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     - IMPORTANTE: Si la maquinaria actual es "plataforma" o "soldadora" y el usuario menciona el tipo de alimentación/combustible, SIEMPRE extraer como tipo_alimentacion
     - IMPORTANTE: Si la última pregunta contiene "alimentación", "combustible", "diésel o gasolina", la respuesta del usuario SIEMPRE debe mapearse a tipo_alimentacion
     - PROHIBIDO: NO inferir ni adivinar tipo_alimentacion si el usuario NO lo mencionó explícitamente. Si el usuario solo menciona marca, modelo o amperaje sin especificar combustible/alimentación, NO extraer tipo_alimentacion.
+
+    REGLAS ESPECIALES PARA TIPO_COMBUSTIBLE EN DETALLES_MAQUINARIA (montacargas):
+    - Aplica SOLO cuando tipo_maquinaria = "montacargas". El campo va dentro de detalles_maquinaria.
+      * Si el usuario dice "eléctrico", "electrico", "de batería", "bateria" → tipo_combustible: "eléctrico" (STRING, con acento)
+      * Si el usuario dice "gasolina", "a gasolina", "de gasolina", "gas" → tipo_combustible: "gasolina" (STRING)
+      * Si el usuario dice "diésel", "diesel", "a diésel", "de diesel" → tipo_combustible: "diésel" (STRING, con acento)
+    - MAPEO DE OPCIÓN NUMERADA: si la última pregunta del bot listó las opciones numeradas de combustible del montacargas (1. eléctrico/eléctricos, 2. gasolina, 3. diésel) y el usuario responde SOLO con un número, mapéalo así: "1" → "eléctrico", "2" → "gasolina", "3" → "diésel".
+    - IMPORTANTE: normalizar SIEMPRE a uno de estos valores exactos: "eléctrico", "gasolina", "diésel".
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
+    - Ejemplos correctos: "Montacargas a Diesel" → {{"tipo_maquinaria": "montacargas", "detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
+    - Ejemplos correctos: (última pregunta listó "1. eléctricos 2. gasolina 3. diésel") + "3" → {{"detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
     
     REGLAS ESPECIALES PARA GIRO_EMPRESA:
     - Si el usuario describe la actividad de su empresa → giro_empresa: [descripción de la actividad]

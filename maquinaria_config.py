@@ -85,8 +85,15 @@ class MachineryConfigService:
             print(f"Loaded {len(self._configs)} machinery configurations from Cosmos DB.")
         except Exception as e:
             print(f"Error connecting/reading from Cosmos DB (machinery_configuration): {e}")
-            # Fallback to local file if DB fails? 
-            # For now let's just log. Implementation plan implies switching 'to' DB.
+
+        # Fallback CRÍTICO: si Cosmos no aportó ninguna configuración (contenedor
+        # 'machinery_configuration' ausente/vacío o error de lectura), usar la config
+        # local. Sin esto, en un entorno sin ese contenedor (ej. PROD) get_config()
+        # devuelve None para todos los tipos, tipo_maquinaria nunca se persiste y el
+        # bot se queda en un loop infinito pidiendo el tipo de maquinaria.
+        if not self._configs:
+            print("ADVERTENCIA: sin configuraciones desde Cosmos. Usando config local de respaldo (machinery_data).")
+            self._configs = self._load_initial_configs_fallback()
 
     def _load_initial_configs_fallback(self) -> Dict[str, MachineryTypeSchema]:
         """

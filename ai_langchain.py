@@ -1587,7 +1587,13 @@ class IntelligentLeadQualificationChatbot:
         # NUEVAS opciones. Sin esto, el flujo podría completarse con una selección
         # obsoleta/nula y nunca re-presentar la opción correcta.
         if not self.state.get("completed") and self.state.get("maquinas_recomendadas"):
-            new_detalles = extracted_info.get("detalles_maquinaria")
+            # Normalizar a los campos canónicos del tipo ANTES de comparar. Sin esto,
+            # una llave no-canónica (ej. altura o "interior/exterior" en montacargas)
+            # se veía como "detalle nuevo" y reseteaba recomendación/selección en cada
+            # turno, dejando el flujo inestable. Solo un cambio REAL en un campo canónico
+            # (capacidad, combustible, etc.) debe invalidar la recomendación previa.
+            tipo_actual = extracted_info.get("tipo_maquinaria") or self.state.get("tipo_maquinaria")
+            new_detalles = self._normalize_detalles_maquinaria(extracted_info.get("detalles_maquinaria"), tipo_actual)
             if isinstance(new_detalles, dict) and new_detalles:
                 current_detalles = self.state.get("detalles_maquinaria", {}) or {}
                 # Detectar si CAMBIA un detalle existente (ej. 300A -> 185A) o si se

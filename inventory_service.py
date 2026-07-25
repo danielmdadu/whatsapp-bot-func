@@ -44,6 +44,12 @@ class InventoryService:
         if self.container:
             # Opción 1: Query a la DB
             inventory_items = self._fetch_from_db(machine_type)
+            # Fallback CRÍTICO: si el contenedor 'machinery_inventory' no existe o está
+            # vacío (ej. PROD, que no lo tiene), _fetch_from_db devuelve []. Sin este
+            # respaldo el bot nunca encontraría máquinas y jamás recomendaría/cotizaría.
+            if not inventory_items:
+                print("ADVERTENCIA: inventario vacío desde Cosmos. Usando inventario local de respaldo (inventory_data).")
+                inventory_items = self._local_inventory_fallback
         else:
             inventory_items = self._local_inventory_fallback
 

@@ -94,6 +94,14 @@ machinery_configurations = [
         "name": "Montacargas",
         "fields": [
             {
+                "name": "tipo_combustible",
+                "question": "¿el montacargas lo requieres eléctrico, a gasolina o diésel?",
+                "reason": "Para seleccionar el montacargas con el tipo de energía correcto",
+                "type": "selection",
+                "required": True,
+                "comparison_operator": "contains"
+            },
+            {
                 "name": "capacidad_toneladas",
                 "question": "¿qué peso requiere levantar en toneladas?",
                 "reason": "Para determinar la capacidad necesaria",
