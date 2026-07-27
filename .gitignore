@@ -142,3 +142,5 @@ test_results/
 test_main_endpoint.py
 
 real_conversations_withLeads/
+
+update_invertory_db/prices.txt
