@@ -264,12 +264,43 @@ class WhatsAppBot:
             
             whatsapp_message_id = response.json()["messages"][0]["id"]
             logging.info(f"[PDF] Quotation PDF sent to {wa_id}. message_id: {whatsapp_message_id}")
+
+            # 3. Registrar el documento en la conversación para que la web lo muestre
+            self._register_outgoing_document(wa_id, media_id, whatsapp_message_id)
+
             return whatsapp_message_id
-            
+
         except Exception as e:
             logging.error(f"[PDF] Error sending PDF to {wa_id}: {e}")
             return None
-    
+
+    def _register_outgoing_document(self, wa_id: str, media_id: str, whatsapp_message_id: str) -> None:
+        """
+        Registra en Cosmos el documento que acaba de enviar el bot, con el mismo
+        esquema que usan los documentos entrantes del lead y los que manda el
+        agente desde la web, para que la plataforma web lo renderice igual.
+        """
+        try:
+            if not self.state_store:
+                logging.warning(f"[PDF] Sin state_store: el documento enviado a {wa_id} no se registró en la conversación")
+                return
+
+            multimedia = {
+                "type": "document",
+                "multimedia_id": media_id
+            }
+
+            self.state_store.add_outgoing_multimedia_message(
+                wa_id,
+                multimedia,
+                whatsapp_message_id,
+                self.chatbot.state,
+                sender="bot"
+            )
+        except Exception as e:
+            # El PDF ya llegó al lead; un fallo aquí no debe romper el envío
+            logging.error(f"[PDF] Error registrando el documento enviado a {wa_id}: {e}")
+
     def process_message(self, wa_id: str, message_text: str, whatsapp_message_id: str, hubspot_manager: HubSpotManager) -> None:
         """
         Procesa un mensaje entrante usando LangChain.

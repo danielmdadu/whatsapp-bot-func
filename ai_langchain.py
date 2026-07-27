@@ -1495,6 +1495,10 @@ class IntelligentLeadQualificationChatbot:
                     "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "sender": "bot"
                 })
+                # Persistir el intro ANTES de mandar el PDF: el envío del documento
+                # registra su propio mensaje en Cosmos, y save_conversation solo
+                # persiste el último mensaje nuevo.
+                self.save_conversation()
             except Exception as e:
                 logging.error(f"[FICHA] Error sending intro message: {e}")
 

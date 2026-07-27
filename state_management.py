@@ -268,7 +268,41 @@ class CosmosDBStateStore(ConversationStateStore):
         except Exception as e:
             logging.error(f"Error agregando mensaje individual: {e}")
             raise
-    
+
+    def add_outgoing_multimedia_message(self, user_id: str, multimedia: Dict[str, Any], whatsapp_message_id: str, state: ConversationState, sender: str = "bot") -> None:
+        """
+        Registra un mensaje multimedia ENVIADO por el bot (p. ej. la cotización en PDF).
+
+        Usa el mismo formato que los multimedia entrantes del lead y que los que
+        manda el agente desde la web, para que la interfaz web los renderice con
+        el mismo componente.
+
+        También agrega el mensaje al estado en memoria: `save_conversation_state`
+        solo persiste el último mensaje nuevo, así que si el estado en memoria no
+        avanza junto con Cosmos, el siguiente guardado se desincroniza.
+        """
+        try:
+            new_message = {
+                "whatsapp_message_id": whatsapp_message_id or "",
+                "sender": sender,
+                "role": "assistant",
+                "content": "",
+                "question_type": "",
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "multimedia": multimedia
+            }
+
+            self._append_messages(user_id, [new_message])
+
+            # Mantener el estado en memoria alineado con lo que quedó en Cosmos
+            if isinstance(state, dict) and isinstance(state.get("messages"), list):
+                state["messages"].append(new_message)
+
+            logging.info(f"Mensaje multimedia saliente registrado para usuario {user_id}: {multimedia}")
+        except Exception as e:
+            # El archivo ya se envió por WhatsApp; no romper el flujo si falla el registro
+            logging.error(f"Error registrando mensaje multimedia saliente para {user_id}: {e}")
+
     def delete_conversation_state(self, user_id: str) -> None:
         """Elimina el estado de conversación de Cosmos DB"""
         try:
@@ -337,7 +371,9 @@ class CosmosDBStateStore(ConversationStateStore):
         for msg in cosmos_doc.get("messages", []):
             msg_converted = {
                 "role": "user" if msg["sender"] == "lead" else "assistant",
-                "content": msg["text"],
+                # Los mensajes multimedia se guardan con text=None; normalizar a ""
+                # para no meter None en el historial que se manda al LLM.
+                "content": msg.get("text") or "",
                 "question_type": msg.get("question_type"),
                 "timestamp": msg.get("timestamp"),
                 "sender": msg["sender"]
