@@ -18,6 +18,11 @@ from datetime import datetime, timezone
 import logging
 from hubspot_manager import HubSpotManager
 from inventory_service import InventoryService
+from machine_reference import (
+    MachineReference,
+    detect_machine_reference,
+    looks_like_machine_code,
+)
 
 langchain.debug = False
 langchain.verbose = False
@@ -142,6 +147,17 @@ class AzureOpenAIConfig:
 # ============================================================================
 # FUNCIONES HELPER
 # ============================================================================
+
+# Preguntas que YA son sobre la máquina. Si el lead manda un código mientras se
+# le pregunta una de estas, el código ES la respuesta y no hay digresión que
+# reconocer. En cualquier otra pregunta (nombre, apellido, datos de empresa) el
+# código interrumpe el flujo y hay que reconocerlo antes de re-preguntar.
+_MACHINERY_QUESTION_TYPES = {
+    "tipo_maquinaria",
+    "detalles_maquinaria",
+    "quiere_cotizacion",
+    "seleccion_maquina",
+}
 
 def _is_distribuidor(giro: str) -> bool:
     """Verifica si el giro corresponde a un distribuidor basado en palabras clave."""
@@ -706,9 +722,10 @@ class IntelligentResponseGenerator:
         history_messages: List[Dict[str, Any]],
         extracted_info: Dict[str, Any], 
         current_state: ConversationState, 
-        next_question: str = None, 
+        next_question: str = None,
         is_inventory_question: bool = False,
-        question_type: str = None
+        question_type: str = None,
+        machine_reference: Optional[MachineReference] = None
     ) -> str:
         """Genera una respuesta contextual apropiada usando un enfoque conversacional"""
         
@@ -916,6 +933,10 @@ class IntelligentResponseGenerator:
             if question_type == "tipo_ayuda":
                 tipo_ayuda_instruction = "IMPORTANTÍSIMO: Cuando vayas a preguntar en qué le puedes ayudar al usuario, EXCLUSIVAMENTE usa la frase: '¿En qué te puedo ayudar?' de forma literal y directa, sin agregar texto adicional a la pregunta."
 
+            machine_reference_instruction = self._build_machine_reference_instruction(
+                machine_reference, next_question, question_type
+            )
+
             current_state_str = get_current_state_str(current_state)
             formatedPrompt = prompt.format_prompt(
                 user_message=message,
@@ -928,6 +949,7 @@ class IntelligentResponseGenerator:
                 extracted_name_instruction=extracted_name_instruction,
                 datos_empresa_instruction=datos_empresa_instruction,
                 tipo_ayuda_instruction=tipo_ayuda_instruction,
+                machine_reference_instruction=machine_reference_instruction,
                 tipos_maquinaria_validos=tipos_maquinaria_validos
             )
 
@@ -951,6 +973,52 @@ class IntelligentResponseGenerator:
             else:
                 return "En un momento le responderemos."
     
+    def _build_machine_reference_instruction(
+        self,
+        machine_reference: Optional[MachineReference],
+        next_question: Optional[str],
+        question_type: Optional[str]
+    ) -> str:
+        """
+        Construye la instrucción para reconocer la máquina que mencionó el lead
+        antes de re-preguntar el dato pendiente.
+
+        Solo aplica cuando el código INTERRUMPE el flujo: hay una pregunta
+        pendiente y NO es una pregunta sobre la máquina (en ese caso el código es
+        la respuesta, no una digresión).
+        """
+        if not machine_reference or not next_question:
+            return ""
+
+        if question_type in _MACHINERY_QUESTION_TYPES:
+            return ""
+
+        if machine_reference.en_inventario and machine_reference.modelo:
+            contexto = (
+                f"Ese código corresponde a la {machine_reference.modelo} "
+                f"({machine_reference.categoria}), que sí manejamos. Puedes referirte a ella "
+                "por su nombre, pero NO afirmes disponibilidad, precio ni características técnicas."
+            )
+        else:
+            contexto = (
+                f"Ese código corresponde a un equipo del tipo '{machine_reference.categoria}'. "
+                "NO afirmes que manejamos ese modelo exacto (no está en nuestro inventario), "
+                "pero tampoco lo niegues: solo reconoce el interés."
+            )
+
+        return f"""
+                RECONOCIMIENTO DE LA MÁQUINA MENCIONADA (PRIORIDAD ALTA):
+                El usuario mencionó el código/modelo de una máquina ("{machine_reference.texto}")
+                en lugar de responder la pregunta pendiente. {contexto}
+                PROHIBIDO repetir la pregunta pendiente en seco: se lee como si no lo hubieras leído.
+                PASO 1 (OBLIGATORIO): Reconoce su interés en UNA sola frase breve, con este patrón:
+                "Entiendo que te interesa esa máquina, pero primero..."
+                PASO 2: En el MISMO mensaje, enlaza de inmediato con la pregunta pendiente.
+                - NO uses otra expresión de confirmación ("Perfecto", "Claro") además de este reconocimiento.
+                - NO inventes datos técnicos, precios ni tiempos de entrega de ese modelo.
+                - Ejemplo de tono: "Entiendo que te interesa esa máquina, pero primero, ¿con quién tengo el gusto?"
+                """
+
     def generate_final_response(self, current_state: ConversationState) -> str:
         """Genera la respuesta final cuando la conversación está completa"""
         
@@ -1080,6 +1148,9 @@ class IntelligentLeadQualificationChatbot:
         # El estado local sigue existiendo para compatibilidad con código existente
         self.state = self._create_empty_state()
 
+        # Referencia a máquina detectada en el mensaje del turno actual (si hubo)
+        self._machine_ref: Optional[MachineReference] = None
+
     def _create_empty_state(self) -> ConversationState:
         """Crea un estado vacío"""
         state = {
@@ -1091,7 +1162,8 @@ class IntelligentLeadQualificationChatbot:
             "asignado_asesor": None,
             "hubspot_contact_id": None,
             "quiere_cotizacion": None,
-            "maquinas_recomendadas": []  # Lista de máquinas recomendadas para mapear posición a modelo
+            "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
+            "maquina_mencionada": None  # Código/modelo que el lead mencionó por su cuenta
         }
         
         # Agregamos los campos que se preguntan al usuario desde el FIELDS_CONFIG_PRIORITY
@@ -1172,8 +1244,13 @@ class IntelligentLeadQualificationChatbot:
             # Obtener la última pregunta del bot para contexto
             last_bot_question, _ = self._get_last_bot_question()
             extracted_info = self.slot_filler.extract_all_information(user_message, self.state, last_bot_question)
-            debug_print(f"DEBUG: Información extraída: {extracted_info}") 
-            
+            debug_print(f"DEBUG: Información extraída: {extracted_info}")
+
+            # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
+            # ANTES de actualizar HubSpot y el estado para que el tipo de maquinaria
+            # inferido llegue a los dos.
+            self._machine_ref = self._detect_and_merge_machine_reference(user_message, extracted_info)
+
             # Actualizar el contacto en HubSpot
             if hubspot_manager:
                 hubspot_manager.update_contact(self.state, extracted_info)
@@ -1205,6 +1282,41 @@ class IntelligentLeadQualificationChatbot:
                     "de nuevo", "vuelve a enviar", "manda otra"]
         msg_lower = message.lower()
         return any(kw in msg_lower for kw in keywords)
+
+    def _detect_and_merge_machine_reference(
+        self, user_message: str, extracted_info: Dict[str, Any]
+    ) -> Optional[MachineReference]:
+        """
+        Detecta el código/modelo de máquina que mencionó el lead y aprovecha lo
+        que revela: guarda el código para no perderlo y, si aún no sabemos el
+        tipo de maquinaria, lo deduce de la categoría del código.
+
+        Devuelve la referencia detectada (o None) para que la generación de
+        respuesta pueda reconocerla antes de re-preguntar el dato pendiente.
+        """
+        ref = detect_machine_reference(user_message)
+        if not ref:
+            return None
+
+        debug_print(f"DEBUG: Referencia a máquina detectada: {ref}")
+
+        # Guardar el código tal como lo escribió el lead para que no se pierda.
+        # Solo el primero: de ahí en adelante manda el flujo normal de maquinaria.
+        if not self.state.get("maquina_mencionada"):
+            self.state["maquina_mencionada"] = ref.texto
+
+        # Si no sabemos el tipo de maquinaria, la categoría del código lo resuelve:
+        # un lead que manda "PDSG900VR" quiere un compresor, no hace falta
+        # preguntárselo. Se inyecta en extracted_info (en lugar de escribir el
+        # estado directo) para que apliquen las validaciones de
+        # _update_state_with_extracted_info y para que el dato llegue a HubSpot.
+        if not extracted_info.get("tipo_maquinaria") and not self.state.get("tipo_maquinaria"):
+            extracted_info["tipo_maquinaria"] = ref.categoria
+            debug_print(
+                f"DEBUG: tipo_maquinaria='{ref.categoria}' inferido del código '{ref.texto}'"
+            )
+
+        return ref
 
     def _process_and_respond(self, user_message: str, extracted_info: Dict[str, Any]) -> str:
         """
@@ -1323,11 +1435,12 @@ class IntelligentLeadQualificationChatbot:
             history_messages,
             extracted_info, 
             self.state, 
-            next_question=next_question_str, 
+            next_question=next_question_str,
             is_inventory_question=is_inventory_question,
-            question_type=next_question_type
+            question_type=next_question_type,
+            machine_reference=self._machine_ref
         )
-        
+
         return self._add_message_and_return_response(generated_response, storage_question_type)
         
     def _add_message_and_return_response(self, response: str, question_type: str) -> str:
@@ -1637,6 +1750,17 @@ class IntelligentLeadQualificationChatbot:
             if value is None or value == "":
                 continue
 
+            # 1.5 Guardia: el código de una máquina NUNCA es el nombre, apellido o
+            # giro del lead. Cuando el lead responde con un código en lugar de
+            # contestar (ej. "PDSG900VR" a "¿Con quién tengo el gusto?"), el LLM a
+            # veces lo clasifica como nombre. Guardarlo contaminaría el estado y el
+            # contacto de HubSpot con un dato falso imposible de corregir después.
+            if key in ("nombre", "apellido", "giro_empresa") and looks_like_machine_code(value):
+                logging.warning(
+                    f"Descartado '{key}'='{value}': parece el código de una máquina, no un dato del lead."
+                )
+                continue
+
             # 2. No sobrescribir campos que ya tienen un valor válido a excepción de:
             # - detalles_maquinaria: se actualiza múltiples veces porque tiene varios subcampos.
             # - quiere_cotizacion: puede cambiar si el usuario corrige su respuesta.
@@ -1758,7 +1882,11 @@ class IntelligentLeadQualificationChatbot:
                 user_messages = [m for m in self.state.get("messages", []) if m.get("role") == "user"]
                 if user_messages:
                     last_user_msg = user_messages[-1].get("content", "").strip()
-                    if last_user_msg and len(last_user_msg) < 100:  # Respuesta razonable, no un párrafo largo
+                    # Si el lead contestó con el código de una máquina en vez del giro,
+                    # NO tomarlo como giro: se re-preguntará y el bot reconocerá la máquina.
+                    if (last_user_msg
+                            and len(last_user_msg) < 100  # Respuesta razonable, no un párrafo largo
+                            and not looks_like_machine_code(last_user_msg)):
                         self.state["giro_empresa"] = last_user_msg
                         debug_print(f"DEBUG: Inferido giro_empresa='{last_user_msg}' por contexto de pregunta sobre giro.")
 
@@ -1917,8 +2045,17 @@ class IntelligentLeadQualificationChatbot:
                 return None
             
             debug_print(f"DEBUG: Procesando mensaje del lead: '{message_content}'")
-            
-            return self._process_and_respond(message_content, {})
+
+            # Detectar la referencia a máquina también en este camino. Es
+            # OBLIGATORIO fijar self._machine_ref en cada turno: la instancia del
+            # chatbot se reutiliza entre requests y un valor viejo haría que el
+            # bot reconociera una máquina que el lead nunca mencionó.
+            extracted_info: Dict[str, Any] = {}
+            self._machine_ref = self._detect_and_merge_machine_reference(message_content, extracted_info)
+            if extracted_info:
+                self._update_state_with_extracted_info(extracted_info)
+
+            return self._process_and_respond(message_content, extracted_info)
             
         except Exception as e:
             logging.error(f"Error procesando último mensaje del lead: {e}")

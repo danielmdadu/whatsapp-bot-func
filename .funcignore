@@ -24,6 +24,7 @@ test_inventory_match_specifications.py
 test_main_endpoint.py
 test_pricing_service.py
 test_pdf_service.py
+test_machine_reference.py
 
 # Directories (without trailing slash to ensure VS Code ignores them properly)
 test_results

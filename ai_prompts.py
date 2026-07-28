@@ -104,6 +104,8 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     - Ejemplos: "soy Paco Perez" → {{"nombre": "Paco", "apellido": "Perez"}}
     - Ejemplos: "soy Paco Perez Diaz" → {{"nombre": "Paco", "apellido": "Perez Diaz"}}
     - Ejemplos: "Mi apellido es Gómez" → {{"apellido": "Gómez"}}
+    - PROHIBIDO: NUNCA extraigas un código o modelo de máquina como "nombre" o "apellido" (ej. "PDSG900VR", "S4046E II", "DGW400DMK", "CPCD30"). Un nombre de persona NO lleva bloques de dígitos pegados a letras.
+    - Ejemplos: Última pregunta "¿Con quién tengo el gusto?" + Mensaje: "PDSG900VR" → {{}} (es el código de una máquina, NO un nombre)
 
     Los tipos de maquinaria disponibles para el campo tipo_maquinaria son:
     {maquinaria_names}
@@ -324,6 +326,7 @@ RESPONSE_GENERATION_PROMPT = ChatPromptTemplate.from_template(
     {presentation_instruction}
     {datos_empresa_instruction}
     {tipo_ayuda_instruction}
+    {machine_reference_instruction}
 
     TIPOS DE MAQUINARIA VÁLIDOS (los ÚNICOS que Alpha C maneja):
     {tipos_maquinaria_validos}
