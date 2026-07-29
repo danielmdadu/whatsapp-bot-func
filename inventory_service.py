@@ -35,10 +35,15 @@ class InventoryService:
         # Pricing service for SQL Server price lookups
         self._pricing_service = get_pricing_service()
 
-    def find_matching_machines(self, machine_type: str, requirements: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def find_matching_machines(self, machine_type: str, requirements: Dict[str, Any], brands: List[str] = None) -> List[Dict[str, Any]]:
         """
         Encuentra máquinas que coincidan con los requerimientos.
         Returns machines sorted by relevance (closest match first).
+
+        `brands` restringe la búsqueda a las marcas que pidió el lead. Se ignora
+        si ninguna máquina de la categoría es de esas marcas: en ese caso ya se
+        le aclara aparte que no manejamos esa marca, y dejarlo sin recomendación
+        sería peor que ofrecerle la alternativa que sí tenemos.
         """
         # Fetch inventory
         if self.container:
@@ -61,6 +66,11 @@ class InventoryService:
         
         if not filtered_machines:
             return []
+
+        if brands:
+            by_brand = [m for m in filtered_machines if self._matches_brand(m, brands)]
+            if by_brand:
+                filtered_machines = by_brand
 
         # Obtener configuración de campos para saber cómo comparar
         config = self.config_service.get_config(machine_type)
@@ -232,6 +242,14 @@ class InventoryService:
         
         # Coincidencia directa o parcial
         return target_keyword in machine_cat or machine_cat in target_keyword
+
+    def _matches_brand(self, machine: Dict[str, Any], brands: List[str]) -> bool:
+        """La marca es el primer token del modelo: 'Toku TCB-300' → 'Toku'."""
+        modelo = str(machine.get("modelo") or "").strip()
+        if not modelo:
+            return False
+        marca = self._strip_accents(modelo.split()[0].lower())
+        return any(marca == self._strip_accents(str(b).strip().lower()) for b in brands)
 
     def _check_requirements(self, machine: Dict[str, Any], requirements: Dict[str, Any], fields_config: List[Any]) -> bool:
         """Verifica si una máquina específica cumple con todos los requerimientos"""

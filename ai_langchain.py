@@ -18,6 +18,15 @@ from datetime import datetime, timezone
 import logging
 from hubspot_manager import HubSpotManager
 from inventory_service import InventoryService
+from brand_reference import (
+    DISPONIBLE_EN_TIPO,
+    BrandAvailability,
+    build_brand_disclaimer,
+    build_brand_facts,
+    canonical_brand,
+    detect_brand_mentions,
+    evaluate_brand_names,
+)
 from machine_reference import (
     MachineReference,
     detect_machine_reference,
@@ -784,6 +793,11 @@ class IntelligentResponseGenerator:
             # invente tipos que no existen en el inventario.
             tipos_maquinaria_validos = ", ".join(machinery_config_service.get_type_display_list())
 
+            # Marcas que pidió el lead, contrastadas contra el inventario. Es la
+            # ÚNICA fuente con la que el bot puede afirmar o negar una marca; sin
+            # esto el LLM improvisa y se contradice entre un mensaje y otro.
+            brand_evaluations = self._pending_brand_evaluations(current_state)
+
             if is_inventory_question:
                 inventory_instruction = (
                     "El mensaje del usuario incluye una pregunta sobre inventario. "
@@ -800,10 +814,26 @@ class IntelligentResponseGenerator:
                 machine_type = current_state.get("tipo_maquinaria")
                 detalles = current_state.get("detalles_maquinaria", {})
                 
+                # Si el lead pidió una marca que SÍ manejamos en este tipo, la
+                # recomendación debe ser de esa marca: ofrecerle otra después de
+                # confirmarle que la tenemos se lee como que no lo escuchamos.
+                marcas_solicitadas_disponibles = [
+                    ev.marca for ev in brand_evaluations
+                    if ev.estatus == DISPONIBLE_EN_TIPO
+                ]
+
                 recommended_machines = []
                 if machine_type:
-                    recommended_machines = self.inventory_service.find_matching_machines(machine_type, detalles)
-                
+                    recommended_machines = self.inventory_service.find_matching_machines(
+                        machine_type, detalles, brands=marcas_solicitadas_disponibles or None
+                    )
+
+                # Aclaración de marcas para este camino, que arma el texto sin LLM.
+                brand_disclaimer = build_brand_disclaimer(brand_evaluations)
+                if brand_evaluations:
+                    current_state["marcas_aclaradas"] = True
+                prefijo_marcas = f"{brand_disclaimer}\n\n" if brand_disclaimer else ""
+
                 if recommended_machines:
                     # Formatear lista de máquinas recomendadas
                     machines_list = ""
@@ -838,25 +868,30 @@ class IntelligentResponseGenerator:
                     current_state["maquinas_recomendadas"] = recommended_models
                     
                     intro_recomendacion = "la siguiente opción disponible" if len(recommended_models) == 1 else "las siguientes opciones disponibles"
-                    
+                    # Tras la aclaración de marcas, un "Muy bien" suena a que se
+                    # celebró la mala noticia; se enlaza directo.
+                    apertura = "Basándome" if prefijo_marcas else "Muy bien, basándome"
+
                     if current_state.get("quiere_cotizacion") is True:
                         cierre_cotizacion = "Para la cotización que solicitaste, ¿te interesa esta opción?" if len(recommended_models) == 1 else "Para la cotización que solicitaste, ¿te interesa alguna de estas opciones?"
-                        return f"""Muy bien, basándome en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
+                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
 {machines_list}
 
 {cierre_cotizacion}"""
                     else:
                         cierre_cotizacion = "¿Te gustaría recibir una cotización formal por esta?" if len(recommended_models) == 1 else "¿Te gustaría recibir una cotización formal por alguna de estas?"
-                        return f"""Muy bien, basándome en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
+                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
 {machines_list}
 {cierre_cotizacion}"""
                 else:
                      # Fallback si no hay coincidencias exactas
+                    # Con aclaración de marcas previa, el "Entendido." sobra.
+                    entendido = "" if prefijo_marcas else "Entendido. "
                     if current_state.get("quiere_cotizacion") is True:
-                        return """Entendido. No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
+                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
                     else:
-                        return """Entendido. No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
- 
+                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
+
 ¿Te gustaría que un asesor te contacte para ofrecerte una solución personalizada?"""
                 # END MODIFICATION
 
@@ -937,6 +972,12 @@ class IntelligentResponseGenerator:
                 machine_reference, next_question, question_type
             )
 
+            brand_instruction = self._build_brand_instruction(brand_evaluations)
+            if brand_instruction:
+                # Ya se le entregó al LLM la verdad sobre las marcas pedidas: no
+                # hay que volver a aclararlas en los turnos siguientes.
+                current_state["marcas_aclaradas"] = True
+
             current_state_str = get_current_state_str(current_state)
             formatedPrompt = prompt.format_prompt(
                 user_message=message,
@@ -950,6 +991,7 @@ class IntelligentResponseGenerator:
                 datos_empresa_instruction=datos_empresa_instruction,
                 tipo_ayuda_instruction=tipo_ayuda_instruction,
                 machine_reference_instruction=machine_reference_instruction,
+                brand_instruction=brand_instruction,
                 tipos_maquinaria_validos=tipos_maquinaria_validos
             )
 
@@ -973,6 +1015,68 @@ class IntelligentResponseGenerator:
             else:
                 return "En un momento le responderemos."
     
+    def _pending_brand_evaluations(self, current_state: ConversationState) -> List[BrandAvailability]:
+        """
+        Marcas pedidas por el lead que el bot todavía NO le ha aclarado,
+        evaluadas contra el inventario y contra el tipo de maquinaria vigente.
+
+        Se re-evalúan cada turno en lugar de guardarse ya resueltas porque el
+        tipo de maquinaria suele llegar DESPUÉS de la marca: el mismo "solo
+        marca Dewalt" significa una cosa antes de saber que quiere un rompedor y
+        otra después.
+        """
+        if current_state.get("marcas_aclaradas"):
+            return []
+
+        marcas = current_state.get("marcas_solicitadas") or []
+        if not marcas:
+            return []
+
+        return evaluate_brand_names(marcas, current_state.get("tipo_maquinaria"))
+
+    def _build_brand_instruction(self, brand_evaluations: List[BrandAvailability]) -> str:
+        """
+        Inyecta al LLM lo que el inventario dice de las marcas que pidió el lead.
+
+        Sin esto el LLM inventa: en una misma conversación llegó a decir
+        "manejamos rompedores Dewalt y Makita" y luego lo contrario.
+        """
+        if not brand_evaluations:
+            return ""
+
+        facts = build_brand_facts(brand_evaluations)
+        if not facts:
+            return ""
+
+        hay_no_disponibles = any(
+            ev.estatus != DISPONIBLE_EN_TIPO for ev in brand_evaluations
+        )
+        instruccion_negativa = (
+            """
+                - Dilo de forma clara y directa, sin rodeos y sin disculpas largas: el lead necesita
+                  saber que no la tenemos para no seguir esperándola.
+                - Inmediatamente después ofrécele lo que SÍ manejamos en el tipo que busca, usando
+                  EXCLUSIVAMENTE las marcas listadas arriba.
+                - PROHIBIDO prometer que la conseguiremos, que la podemos pedir o que llegará después."""
+            if hay_no_disponibles else
+            """
+                - Confírmaselo de forma breve, sin exagerar ni prometer disponibilidad inmediata,
+                  stock, tiempos de entrega ni precio."""
+        )
+
+        return f"""
+                DISPONIBILIDAD DE MARCAS (VERDAD ABSOLUTA - PRIORIDAD MÁXIMA):
+                El lead preguntó por marcas específicas. Esto es lo que dice nuestro inventario
+                REAL y es la ÚNICA fuente válida sobre marcas:
+{facts}
+                REGLAS OBLIGATORIAS:
+                - Responde a la marca ANTES de continuar con la pregunta pendiente. No la ignores.{instruccion_negativa}
+                - PROHIBIDO afirmar o insinuar que manejamos una marca que arriba diga "NO la manejamos".
+                - PROHIBIDO mencionar cualquier otra marca que no aparezca en la lista de arriba.
+                - No inventes modelos, características ni precios de ninguna marca.
+                - Después de aclarar la marca, en el MISMO mensaje enlaza con la pregunta pendiente.
+                """
+
     def _build_machine_reference_instruction(
         self,
         machine_reference: Optional[MachineReference],
@@ -1163,7 +1267,9 @@ class IntelligentLeadQualificationChatbot:
             "hubspot_contact_id": None,
             "quiere_cotizacion": None,
             "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
-            "maquina_mencionada": None  # Código/modelo que el lead mencionó por su cuenta
+            "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
+            "marcas_solicitadas": [],  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
+            "marcas_aclaradas": False  # True cuando el bot ya le respondió sobre esas marcas
         }
         
         # Agregamos los campos que se preguntan al usuario desde el FIELDS_CONFIG_PRIORITY
@@ -1251,6 +1357,10 @@ class IntelligentLeadQualificationChatbot:
             # inferido llegue a los dos.
             self._machine_ref = self._detect_and_merge_machine_reference(user_message, extracted_info)
 
+            # Registrar las marcas que pidió el lead para poder confirmarlas o
+            # negarlas contra el inventario al generar la respuesta.
+            self._detect_and_store_brands(user_message)
+
             # Actualizar el contacto en HubSpot
             if hubspot_manager:
                 hubspot_manager.update_contact(self.state, extracted_info)
@@ -1317,6 +1427,33 @@ class IntelligentLeadQualificationChatbot:
             )
 
         return ref
+
+    def _detect_and_store_brands(self, user_message: str) -> None:
+        """
+        Guarda en el estado las marcas que pidió el lead.
+
+        Solo DETECTA y acumula; la evaluación contra el inventario se hace al
+        generar la respuesta, cuando el estado ya tiene el tipo de maquinaria
+        (el lead suele decir la marca antes de decir qué máquina quiere).
+
+        Mencionar una marca reabre SIEMPRE la aclaración, aunque ya se le haya
+        respondido antes: si el lead vuelve a preguntar es porque necesita la
+        respuesta otra vez. La bandera `marcas_aclaradas` solo evita repetir la
+        aclaración en los turnos donde el lead ya no habla de marcas.
+        """
+        mentions = detect_brand_mentions(user_message)
+        if not mentions:
+            return
+
+        marcas = list(self.state.get("marcas_solicitadas") or [])
+        for mention in mentions:
+            marca = canonical_brand(mention)
+            if marca.lower() not in [m.lower() for m in marcas]:
+                marcas.append(marca)
+
+        self.state["marcas_solicitadas"] = marcas
+        self.state["marcas_aclaradas"] = False
+        debug_print(f"DEBUG: Marcas solicitadas por el lead: {marcas}")
 
     def _process_and_respond(self, user_message: str, extracted_info: Dict[str, Any]) -> str:
         """
@@ -2052,6 +2189,7 @@ class IntelligentLeadQualificationChatbot:
             # bot reconociera una máquina que el lead nunca mencionó.
             extracted_info: Dict[str, Any] = {}
             self._machine_ref = self._detect_and_merge_machine_reference(message_content, extracted_info)
+            self._detect_and_store_brands(message_content)
             if extracted_info:
                 self._update_state_with_extracted_info(extracted_info)
 
