@@ -1,2200 +1,398 @@
-import json
-import re
-import os
-from typing import Dict, Any, List, Optional, Tuple
-from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-import langchain
-from ai_prompts import (
-    NEGATIVE_RESPONSE_PROMPT, 
-    EXTRACTION_PROMPT, 
-    RESPONSE_GENERATION_PROMPT, 
-    INVENTORY_DETECTION_PROMPT
+
+# ============================================================================
+# PROMPTS PARA SLOT FILLING
+# ============================================================================
+
+NEGATIVE_RESPONSE_PROMPT = ChatPromptTemplate.from_template(
+    """
+    Eres un asistente experto en detectar respuestas negativas o de incertidumbre y determinar a qué campo específico pertenecen.
+    
+    ÚLTIMA PREGUNTA DEL BOT: {last_bot_question}
+    MENSAJE DEL USUARIO: {message}
+    
+    INSTRUCCIONES:
+    Analiza si el usuario está dando una respuesta negativa o de incertidumbre y determina a qué campo específico pertenece.
+    
+    RESPUESTAS NEGATIVAS (response_type: "No tiene"):
+    - "no", "no tenemos", "no hay", "no tengo", "no cuenta con"
+    - "no tengo correo", "no tengo teléfono", "no tengo empresa"
+    - "solo facebook", "solo instagram", "solo redes sociales"
+    - Cualquier variación de "no" + el objeto de la pregunta
+    
+    RESPUESTAS DE INCERTIDUMBRE (response_type: "No especificado"):
+    - "no sé", "no estoy seguro", "no lo sé", "no tengo idea"
+    - "no quiero dar esa información", "prefiero no decir", "es confidencial"
+    - "no estoy seguro", "tal vez", "posiblemente", "creo que no"
+    
+    CAMPOS DISPONIBLES:
+    {fields_available}
+    
+    Si NO es una respuesta negativa ni de incertidumbre, retorna "None".
+    
+    IMPORTANTE: Responde EXACTAMENTE en formato JSON:
+    - Si es respuesta negativa: {{"response_type": "No tiene", "field": "nombre_del_campo"}}
+    - Si es respuesta de incertidumbre: {{"response_type": "No especificado", "field": "nombre_del_campo"}}
+    - Si no es respuesta negativa: "None"
+    """
 )
-from maquinaria_config import machinery_config_service, get_required_fields_for_tipo
-from state_management import ConversationState, ConversationStateStore, InMemoryStateStore, FIELDS_CONFIG_PRIORITY
-from datetime import datetime, timezone
-import logging
-from hubspot_manager import HubSpotManager
-from inventory_service import InventoryService
-from brand_reference import (
-    DISPONIBLE_EN_TIPO,
-    BrandAvailability,
-    build_brand_disclaimer,
-    build_brand_facts,
-    canonical_brand,
-    detect_brand_mentions,
-    evaluate_brand_names,
+
+EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
+    """
+    Eres un asistente experto en extraer información de mensajes de usuarios.
+    
+    Analiza el mensaje del usuario y extrae TODA la información disponible.
+    Solo extrae campos que NO estén ya completos en el estado actual.
+    
+    ESTADO ACTUAL:
+    {current_state_str}
+    
+    ÚLTIMA PREGUNTA DEL BOT: {last_bot_question}
+    
+    MENSAJE DEL USUARIO: {message}
+    
+    INSTRUCCIONES:
+    1. Solo extrae campos que estén VACÍOS en el estado actual, CON EXCEPCIÓN de tipo_maquinaria y detalles_maquinaria que SÍ pueden ser re-extraídos si el usuario cambia de opinión (ver regla de CAMBIO DE OPINIÓN abajo).
+    2. Para detalles_maquinaria, incluye campos específicos que el usuario mencione, incluso si ya tienen valor (el usuario puede corregir o cambiar sus respuestas).
+    3. Responde SOLO en formato JSON válido, sin texto ni explicaciones adicionales
+    4. Si el mensaje del usuario no contiene ABSOLUTAMENTE NINGUNA información relevante para campos vacíos, responde con {{}} (JSON vacío). Pero si el mensaje contiene un nombre, apellido, tipo de maquinaria, correo, teléfono, o cualquier dato relevante, SIEMPRE extráelo.
+    5. NO extraigas información de campos que ya están llenos, A MENOS de que: (a) el usuario elija una máquina recomendada y necesites actualizar maquina_seleccionada, o (b) el usuario cambie de opinión sobre tipo_maquinaria o detalles_maquinaria.
+    6. CLASIFICACIÓN INTELIGENTE: Si la última pregunta es sobre un campo específico, clasifica la respuesta en ese campo. Ejemplo: si la última pregunta es "¿Con quién tengo el gusto?" y el usuario dice "Me llamo Ana", extrae {{"nombre": "Ana"}}.
+    7. IMPORTANTE: giro_empresa y detalles_maquinaria.actividad son campos INDEPENDIENTES. Si la información aplica para ambos, extráela en AMBOS.
+    8. REGLA CRÍTICA PARA giro_empresa vs tipo_cliente: Cuando el usuario responde a la pregunta de si se dedica a la venta/renta de maquinaria, eso SOLO debe extraerse como tipo_cliente. NO extraigas giro_empresa de esa respuesta. El giro_empresa se pregunta POR SEPARADO más adelante en el flujo. Ejemplo: "nos dedicamos a la renta de maquinaria" en respuesta a "¿te dedicas a la venta/renta?" → SOLO {{"tipo_cliente": "distribuidor"}}, NO giro_empresa.
+    
+    CAMBIO DE OPINIÓN DEL USUARIO (PRIORIDAD ALTA):
+    - Si el usuario indica que quiere CAMBIAR el tipo de maquinaria (ej: "mejor quiero una soldadora", "no, prefiero un generador", "cambia a compresor"), SIEMPRE extrae el nuevo tipo_maquinaria, AUNQUE ya tenga un valor en el estado.
+    - Si el usuario quiere cambiar un detalle específico de maquinaria (ej: "mejor de 15 metros", "no, la quiero de diésel", "cámbialo a articulada"), SIEMPRE extrae el nuevo valor en detalles_maquinaria, AUNQUE ya tenga un valor.
+    - Ejemplos:
+      * Estado: tipo_maquinaria = "plataforma", usuario dice "mejor quiero una soldadora" → {{"tipo_maquinaria": "soldadora"}}
+      * Estado: detalles_maquinaria.altura_trabajo_m = 10, usuario dice "mejor de 15 metros" → {{"detalles_maquinaria": {{"altura_trabajo_m": 15}}}}
+      * Estado: detalles_maquinaria.tipo_plataforma = "tijera", usuario dice "mejor articulada" → {{"detalles_maquinaria": {{"tipo_plataforma": "articulada"}}}}
+    
+    REGLAS DE ORO (PRIORIDAD MÁXIMA - SIEMPRE APLICAN):
+    1. Si el usuario dice su nombre ("soy [nombre]", "me llamo [nombre]", "mi nombre es [nombre]"), SIEMPRE extrae "nombre". Si incluye apellido, TAMBIÉN extrae "apellido". NUNCA retornes {{}} cuando el usuario dice su nombre.
+    2. Si el usuario dice su apellido ("mi apellido es [apellido]", "apellido [apellido]"), SIEMPRE extrae "apellido". NUNCA retornes {{}} cuando el usuario dice su apellido.
+    3. Si el usuario menciona una empresa ("Trabajo en X", "Soy de X", "Empresa X", "Vengo de X"), SIEMPRE extrae "nombre_empresa": "X".
+    4. Si el usuario menciona un correo, SIEMPRE extrae "correo".
+    5. Si el usuario menciona un teléfono, SIEMPRE extrae "telefono".
+    6. Si hay información positiva y negativa, SIEMPRE extrae la positiva.
+    7. Si el usuario dice "nos dedicamos a [actividad]" o describe su actividad, extrae "giro_empresa": "[actividad]". EXCEPCIÓN IMPORTANTE: Si la respuesta es sobre venta/renta/distribución de maquinaria Y el contexto es la pregunta de tipo_cliente ("¿te dedicas a la venta/renta?"), SOLO extrae tipo_cliente: "distribuidor", NO giro_empresa. El giro_empresa se pregunta por separado después.
+    8. REGLA PRIORITARIA PARA tipo_cliente (aplica SIN IMPORTAR cuál fue la última pregunta del bot):
+       - Si el usuario menciona que se dedica a la RENTA, VENTA, DISTRIBUCIÓN o COMERCIALIZACIÓN de maquinaria/equipos, y tipo_cliente está vacío → SIEMPRE extraer tipo_cliente: "distribuidor"
+       - Si el usuario dice que es para USO PROPIO, USO DE LA EMPRESA, USO INTERNO, y tipo_cliente está vacío → SIEMPRE extraer tipo_cliente: "cliente_final"
+       - Cualquier respuesta afirmativa ("sí", "si me dedico", "renta", "soy distribuidor") o indicación de venta, reventa, distribución, renta de maquinaria, comercialización → "distribuidor" (exactamente este string)
+       - Cualquier respuesta negativa ("no", "no me dedico a eso", "es para uso propio", "para mi empresa", "uso interno") o indicación de uso propio, uso de empresa, uso interno → "cliente_final" (exactamente este string)
+       - IMPORTANTE: Si el usuario dice "nos dedicamos a la renta/venta de maquinaria" o similar EN RESPUESTA a la pregunta de tipo_cliente, SOLO extraer tipo_cliente: "distribuidor". NO extraer giro_empresa de esta respuesta.
+       - Ejemplos: "Sí me dedico a la venta" → {{"tipo_cliente": "distribuidor"}}
+       - Ejemplos: "nos dedicamos a la renta de maquinaria" → {{"tipo_cliente": "distribuidor"}}
+       - Ejemplos: "ah sí, nos dedicamos a la renta de maquinaria" → {{"tipo_cliente": "distribuidor"}}
+       - Ejemplos: "No, la quiero para usarla yo" → {{"tipo_cliente": "cliente_final"}}
+       - Ejemplos: "uso propio" → {{"tipo_cliente": "cliente_final"}}
+       - Ejemplos: "quiero comercializarla, es para venta" → {{"tipo_cliente": "distribuidor"}}
+       - Ejemplos: "para distribución" → {{"tipo_cliente": "distribuidor"}}
+    
+    CAMPOS A EXTRAER (solo si están vacíos):
+    {fields_available}
+
+    REGLAS ESPECIALES PARA NOMBRES (PRIORIDAD MÁXIMA):
+    - Si el usuario dice "soy [nombre]", "me llamo [nombre]", "hola, soy [nombre]", "mi nombre es [nombre]" → extraer nombre (y apellido si aplica)
+    - Si el usuario dice "mi apellido es [apellido]" → extraer apellido
+    - Para nombres de 1 palabra: llenar solo "nombre"
+    - Para nombres de 2+ palabras: llenar "nombre" con la primera palabra y "apellido" con el resto
+    - Ejemplos: "Me llamo Ana" → {{"nombre": "Ana"}}
+    - Ejemplos: "soy Paco" → {{"nombre": "Paco"}}
+    - Ejemplos: "soy Paco Perez" → {{"nombre": "Paco", "apellido": "Perez"}}
+    - Ejemplos: "soy Paco Perez Diaz" → {{"nombre": "Paco", "apellido": "Perez Diaz"}}
+    - Ejemplos: "Mi apellido es Gómez" → {{"apellido": "Gómez"}}
+    - PROHIBIDO: NUNCA extraigas un código o modelo de máquina como "nombre" o "apellido" (ej. "PDSG900VR", "S4046E II", "DGW400DMK", "CPCD30"). Un nombre de persona NO lleva bloques de dígitos pegados a letras.
+    - Ejemplos: Última pregunta "¿Con quién tengo el gusto?" + Mensaje: "PDSG900VR" → {{}} (es el código de una máquina, NO un nombre)
+
+    Los tipos de maquinaria disponibles para el campo tipo_maquinaria son:
+    {maquinaria_names}
+    
+    REGLAS ADICIONALES PARA DETALLES DE MAQUINARIA (PRIORIDAD MÁXIMA - STRICT MODE):
+    {machine_specific_fields}
+    - IMPORTANTE: Usa EXACTAMENTE los nombres de campos listados arriba (keys del JSON).
+    - NO uses sinónimos ni inventes nombres. Si el usuario dice "volumen", usa el campo correspondiente (ej. "caudal_cfm_max").
+    - NO extraigas campos que no estén en esta lista.
+    - PROHIBIDO inventar campos como: "proyecto", "aplicación", "capacidad_volumen", "capacidad_de_volumen", "volumen", etc.
+    - IMPORTANTE: Si el usuario dice "para venta", extráelo como "tipo_cliente": "distribuidor", y NO como actividad en detalles_maquinaria.
+    
+    REGLAS ESPECIALES PARA VALORES NUMÉRICOS:
+    - IMPORTANTE: Si un campo representa una cantidad numérica (ej. "altura_trabajo_m", "potencia_kw", "amperaje_amps_max", "capacidad_toneladas", "caudal_cfm_max", etc.), el valor extraído DEBE SER UN NÚMERO (INTEGER O FLOAT), NUNCA UN STRING.
+    - Para PLATAFORMA, la altura SIEMPRE va en "altura_trabajo_m" (NUNCA uses "altura_plataforma_m"). Ej: "plataforma de 6 metros" → {{"detalles_maquinaria": {{"altura_trabajo_m": 6}}}}.
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"altura_trabajo_m": 11, "capacidad_toneladas": 3}}}}
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"potencia_kw": 20}}}}
+    - Ejemplos INCORRECTOS: {{"detalles_maquinaria": {{"altura_trabajo_m": "11", "capacidad_toneladas": "3"}}}}
+    - Ejemplos INCORRECTOS: {{"detalles_maquinaria": {{"potencia_kw": "20"}}}}
+    
+    
+    REGLAS ESPECIALES PARA TIPO_PLATAFORMA EN DETALLES_MAQUINARIA (plataforma):
+    - Para el campo "tipo_plataforma" (plataforma de elevación):
+      * Si el usuario dice "tijera", "de tijera", "tipo tijera", "plataforma tijera" → tipo_plataforma: "tijera"
+      * Si el usuario dice "articulada", "de articulada", "tipo articulada", "brazo articulado" → tipo_plataforma: "articulada"
+      * Si el usuario dice "unipersonal", "personal", "de una persona", "para una persona" → tipo_plataforma: "unipersonal"
+    - IMPORTANTE: Normalizar SIEMPRE a uno de estos valores exactos: "tijera", "articulada", "unipersonal"
+    - NUNCA incluir prefijos como "de" o "tipo" en el valor extraído
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_plataforma": "tijera"}}}}
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_plataforma": "articulada"}}}}
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_plataforma": "unipersonal"}}}}
+    - Ejemplos INCORRECTOS: {{"detalles_maquinaria": {{"tipo_plataforma": "de tijera"}}}}
+    
+    REGLAS ESPECIALES PARA TIPO_COMPRESOR EN DETALLES_MAQUINARIA (compresor):
+    - Para el campo "tipo_compresor" (compresor):
+      * Si el usuario dice "portátil", "portatil", "móvil", "movil", "de arrastre" → tipo_compresor: "portátil"
+      * Si el usuario dice "estacionario", "eléctrico", "electrico", "fijo" → tipo_compresor: "estacionario"
+    - IMPORTANTE: Normalizar SIEMPRE a uno de estos valores exactos: "portátil", "estacionario"
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_compresor": "portátil"}}}}
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_compresor": "estacionario"}}}}
+    
+    REGLAS ESPECIALES PARA TIPO_ALIMENTACION EN DETALLES_MAQUINARIA (plataforma, soldadora):
+    - IMPORTANTE: Las reglas de extracción son DIFERENTES según el tipo de maquinaria actual:
+    
+    A) Para PLATAFORMA (tipo_maquinaria = "plataforma"):
+       - IMPORTANTE: tipo_alimentacion SOLO se debe extraer cuando tipo_plataforma es "articulada". Para tijera, unipersonal y mástil, NO extraer tipo_alimentacion ya que todas son eléctricas.
+       * Si el usuario dice "eléctrica", "electrica", "eléctrico", "electrico", "de batería", "bateria" → tipo_alimentacion: "electrica" (STRING)
+       * Si el usuario dice "combustible", "diésel", "diesel", "gasolina", "gas", "de motor" → tipo_alimentacion: "combustible" (STRING)
+       - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_alimentacion": "electrica"}}}}
+       - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_alimentacion": "combustible"}}}}
+    
+    B) Para SOLDADORA (tipo_maquinaria = "soldadora"):
+       * Si el usuario dice "diésel", "diesel", "de diésel" → tipo_alimentacion: "diésel" (STRING, con acento)
+       * Si el usuario dice "gasolina", "de gasolina", "a gasolina" → tipo_alimentacion: "gasolina" (STRING)
+       * NO usar "combustible" para soldadoras, SIEMPRE especificar "diésel" o "gasolina"
+       - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_alimentacion": "diésel"}}}}
+       - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_alimentacion": "gasolina"}}}}
+       - Ejemplos INCORRECTOS: {{"detalles_maquinaria": {{"tipo_alimentacion": "combustible"}}}}
+    
+    - IMPORTANTE: Si la maquinaria actual es "plataforma" o "soldadora" y el usuario menciona el tipo de alimentación/combustible, SIEMPRE extraer como tipo_alimentacion
+    - IMPORTANTE: Si la última pregunta contiene "alimentación", "combustible", "diésel o gasolina", la respuesta del usuario SIEMPRE debe mapearse a tipo_alimentacion
+    - PROHIBIDO: NO inferir ni adivinar tipo_alimentacion si el usuario NO lo mencionó explícitamente. Si el usuario solo menciona marca, modelo o amperaje sin especificar combustible/alimentación, NO extraer tipo_alimentacion.
+
+    REGLAS ESPECIALES PARA TIPO_COMBUSTIBLE EN DETALLES_MAQUINARIA (montacargas):
+    - Aplica SOLO cuando tipo_maquinaria = "montacargas". El campo va dentro de detalles_maquinaria.
+      * Si el usuario dice "eléctrico", "electrico", "de batería", "bateria" → tipo_combustible: "eléctrico" (STRING, con acento)
+      * Si el usuario dice "gasolina", "a gasolina", "de gasolina", "gas" → tipo_combustible: "gasolina" (STRING)
+      * Si el usuario dice "diésel", "diesel", "a diésel", "de diesel" → tipo_combustible: "diésel" (STRING, con acento)
+    - MAPEO DE OPCIÓN NUMERADA: si la última pregunta del bot listó las opciones numeradas de combustible del montacargas (1. eléctrico/eléctricos, 2. gasolina, 3. diésel) y el usuario responde SOLO con un número, mapéalo así: "1" → "eléctrico", "2" → "gasolina", "3" → "diésel".
+    - IMPORTANTE: normalizar SIEMPRE a uno de estos valores exactos: "eléctrico", "gasolina", "diésel".
+    - Ejemplos correctos: {{"detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
+    - Ejemplos correctos: "Montacargas a Diesel" → {{"tipo_maquinaria": "montacargas", "detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
+    - Ejemplos correctos: (última pregunta listó "1. eléctricos 2. gasolina 3. diésel") + "3" → {{"detalles_maquinaria": {{"tipo_combustible": "diésel"}}}}
+    
+    REGLAS ESPECIALES PARA GIRO_EMPRESA:
+    - Si el usuario describe la actividad de su empresa → giro_empresa: [descripción de la actividad]
+    - Si el usuario dice "nos dedicamos a la [actividad]" → giro_empresa: [actividad]
+    - Ejemplos: "venta de maquinaria pesada", "construcción", "manufactura", "servicios de mantenimiento", "distribución", "logística", "mineria", etc.
+    - Extrae la actividad principal, no solo palabras sueltas
+    - IMPORTANTE: Si la última pregunta fue sobre el giro de la empresa, CUALQUIER respuesta descriptiva debe ser tomada como giro_empresa.
+    - Ejemplo: Pregunta "¿Cuál es el giro?" + Respuesta "Mineria" → giro_empresa: "Mineria"
+    - Ejemplo: Pregunta "¿A qué se dedican?" + Respuesta "Nos dedicamos a la mineria" → giro_empresa: "mineria"
+    
+    REGLAS ESPECIALES PARA tipo_cliente:
+    - PRIORIDAD MÁXIMA: Esta regla aplica SIN IMPORTAR cuál fue la última pregunta del bot. Si el usuario menciona renta/venta/distribución de maquinaria, SIEMPRE extraer tipo_cliente.
+    - PARA distribuidor: Si el usuario responde afirmativamente, dice que sí vende/renta, o que es para reventa/distribución:
+      * "sí", "si me dedico", "venta de maquinaria", "renta", "para venta", "es para vender", "para comercializar", "distribución" → tipo_cliente: "distribuidor"
+      * "nos dedicamos a la renta", "nos dedicamos a la renta de maquinaria", "renta de maquinaria", "renta de equipo", "rentamos maquinaria" → tipo_cliente: "distribuidor"
+    - PARA cliente_final: Si el usuario responde negativamente, dice que es para uso propio, o uso de la empresa:
+      * "no", "no me dedico a eso", "es para uso propio", "para mi empresa", "uso interno", "para trabajo interno" → tipo_cliente: "cliente_final"
+      * "es para nuestra empresa", "es para la empresa", "es para uso de la empresa" → tipo_cliente: "cliente_final"
+    - IMPORTANTE: El valor SIEMPRE debe ser exactamente "cliente_final" o "distribuidor" (STRING).
+    - IMPORTANTE: Si el usuario dice que se dedica a la RENTA o VENTA de maquinaria/equipos, SIEMPRE es tipo_cliente: "distribuidor". NO extraer giro_empresa de esta respuesta; el giro se pregunta por separado.
+    - Ejemplos correctos:
+      * "No, es para nuestra empresa" → {{"tipo_cliente": "cliente_final"}}
+      * "Sí, vendemos" → {{"tipo_cliente": "distribuidor"}}
+      * "nos dedicamos a la renta de maquinaria" → {{"tipo_cliente": "distribuidor"}}
+      * "ah sí, nos dedicamos a la renta de maquinaria" → {{"tipo_cliente": "distribuidor"}}
+      * "es para uso propio" → {{"tipo_cliente": "cliente_final"}}
+      * "Para venta" → {{"tipo_cliente": "distribuidor"}}
+    
+    REGLAS ESPECIALES PARA CONSTANCIA_FISCAL_ENTREGADA:
+    - Si el bot requirió la Constancia de Situación Fiscal y el usuario adjuntó documento, foto, o reponde con textos similares a "aquí la adjunto", "ya te la mandé", "listo", "claro que sí", "aquí está" → constancia_fiscal_entregada: true (BOOLEANO)
+    - Si el usuario dice que "no la tiene", "no", "no cuento con ella", "después", "te la debo", "no tengo la constancia", "no la tengo" → constancia_fiscal_entregada: "No tiene" (STRING)
+    - EJEMPLO MÚLTIPLE: Si el bot pide ubicación y constancia y el usuario responde "estamos en Querétaro, pero no tengo la constancia" → {{"lugar_requerimiento": "Querétaro", "constancia_fiscal_entregada": "No tiene"}}
+    
+    REGLAS ESPECIALES PARA TIPO_AYUDA:
+    - Si la última pregunta es "¿En qué te puedo ayudar?" o similar, analiza si el usuario menciona:
+      * MAQUINARIA: Si menciona cualquier tipo de maquinaria (soldadora, compresor, generador, montacargas, etc.), o cualquier cosa relacionada con equipos/máquinas → tipo_ayuda: "maquinaria"
+      * OTRO: Si menciona refacciones (sin contexto de maquinaria), créditos, financiamiento, información general, servicios, o cualquier otra cosa que NO sea maquinaria → tipo_ayuda: "otro"
+    - Ejemplos de MAQUINARIA: "necesito una soldadora", "quiero un compresor", "busco generadores", "equipos de construcción", "quiero una maquina pesada"
+    - Ejemplos de OTRO: "refacciones" (sin contexto), "créditos", "financiamiento", "servicios", "cotización de refacciones" (sin mencionar maquinaria específica)
+    - IMPORTANTE: Si el usuario menciona maquinaria específica o tipos de maquinaria, SIEMPRE es "maquinaria"
+    
+    EJEMPLOS DE EXTRACCIÓN:
+    - Mensaje: "soy Renato Fuentes" → {{"nombre": "Renato", "apellido": "Fuentes"}}
+    - Mensaje: "me llamo Mauricio Martinez Rodriguez" → {{"nombre": "Mauricio", "apellido": "Martinez Rodriguez"}}
+    - Mensaje: "venta de maquinaria" → {{"giro_empresa": "venta de maquinaria"}}
+    - Mensaje: "construcción y mantenimiento" → {{"giro_empresa": "construcción y mantenimiento"}}
+    - Mensaje: "no, es para uso propio" → {{"tipo_cliente": "cliente_final"}}
+    - Mensaje: "sí me dedico a la renta" → {{"tipo_cliente": "distribuidor"}}
+    - Mensaje: "en la Ciudad de México" → {{"lugar_requerimiento": "Ciudad de México"}}
+    - Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
+    - Mensaje: "555-1234" → {{"telefono": "555-1234"}}
+    
+    EJEMPLOS DE USO DEL CONTEXTO DE LA ÚLTIMA PREGUNTA:
+    - Última pregunta: "¿En qué compañía trabajas?" + Mensaje: "Facebook" → {{"nombre_empresa": "Facebook"}}
+    - Última pregunta: "¿Cuál es el giro de su empresa?" + Mensaje: "Construcción" → {{"giro_empresa": "Construcción"}}
+    - Última pregunta: "¿Cuál es su correo electrónico?" + Mensaje: "daniel@empresa.com" → {{"correo": "daniel@empresa.com"}}
+    - Última pregunta: "¿Te dedicas a la venta/renta de maquinaria?" + Mensaje: "Sí" → {{"tipo_cliente": "distribuidor"}}
+    - Última pregunta: "¿Te dedicas a la venta/renta de maquinaria?" + Mensaje: "No, es para nuestra empresa" → {{"tipo_cliente": "cliente_final"}}
+    - Última pregunta: "¿El equipo es para venta o para uso propio?" + Mensaje: "Es para uso de la empresa" → {{"tipo_cliente": "cliente_final"}}
+    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Necesito una soldadora" → {{"tipo_ayuda": "maquinaria"}}
+    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Quiero información sobre créditos" → {{"tipo_ayuda": "otro"}}
+    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Refacciones" → {{"tipo_ayuda": "otro"}}
+    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Refacciones para mi compresor" → {{"tipo_ayuda": "maquinaria"}}
+
+    REGLAS PARA MENSAJES MIXTOS (POSITIVO + NEGATIVO):
+    - Si el mensaje contiene información positiva (datos que SÍ tiene) y negativa (datos que NO tiene), extrae LA INFORMACIÓN POSITIVA.
+    - Ejemplo: "Trabajo en Google pero no sé el giro" → {{"nombre_empresa": "Google"}}
+    - Ejemplo: "No tengo correo pero mi teléfono es 555555" → {{"telefono": "555555"}}
+    - IMPORTANTE: No dejes de extraer la información positiva por culpa de la negativa.
+
+    REGLAS ESPECIALES PARA NOMBRE_EMPRESA:
+    - Si el usuario dice "Trabajo para [Empresa]", "Soy de [Empresa]", "Vengo de [Empresa]" → nombre_empresa: [Empresa]
+    - Ejemplo: "Trabajo para MachinesCorp" → {{"nombre_empresa": "MachinesCorp"}}
+
+    REGLAS ESPECIALES PARA PREGUNTAS SOBRE INVENTARIO:
+    - Si el usuario pregunta "¿tienen [tipo]?" → extraer [tipo] como tipo_maquinaria
+    - Si el usuario pregunta "¿manejan [tipo]?" → extraer [tipo] como tipo_maquinaria  
+    - Si el usuario pregunta "necesito [tipo]" → extraer [tipo] como tipo_maquinaria
+    - Ejemplos: "¿tienen generadores?" → {{"tipo_maquinaria": "generador"}}
+    - Ejemplos: "¿manejan soldadoras?" → {{"tipo_maquinaria": "soldadora"}}
+    - Ejemplos: "necesito un compresor" → {{"tipo_maquinaria": "compresor"}}
+    - IMPORTANTE: Incluso en preguntas sobre inventario, SIEMPRE extraer tipo_maquinaria si se menciona
+    
+    REGLAS ESPECIALES PARA QUIERE_COTIZACION:
+    - Si la última pregunta del bot contiene "¿Quieres que te cotice" o "¿Te gustaría recibir una cotización" o similar sobre cotización:
+      * Si el usuario dice "sí", "si", "claro", "por favor", "ok", "dale", "adelante", "quiero", "me interesa" → quiere_cotizacion: true (BOOLEANO)
+      * Si el usuario comienza a dar datos de la empresa (nombre, giro, ubicación, correo, teléfono) o el tipo de uso (venta o uso propio) → quiere_cotizacion: true (BOOLEANO)
+      * Si el usuario proporciona la respuesta a si el equipo es para "uso propio" o "distribuidor" → quiere_cotizacion: true (BOOLEANO)
+      * Si el usuario selecciona una máquina específica: "quiero la 1", "la primera", "la segunda", "me interesa la 3", "la de [característica]" → quiere_cotizacion: true (BOOLEANO)
+      * Si el usuario dice "no", "no gracias", "no quiero", "no me interesa", "no por ahora", "después", "más tarde" → quiere_cotizacion: false (BOOLEANO)
+    - IMPORTANTE: El valor debe ser un BOOLEANO JSON (true o false), NO un string ("sí", "no", "true", "false")
+    - Ejemplos correctos: "sí" → {{"quiere_cotizacion": true}}
+    - Ejemplos correctos: "no" → {{"quiere_cotizacion": false}}
+    - Ejemplos correctos: "claro, quiero cotización" → {{"quiere_cotizacion": true}}
+    - Ejemplos correctos: "no gracias" → {{"quiere_cotizacion": false}}
+    - Ejemplos correctos: "quiero la 1" → {{"quiere_cotizacion": true}}
+    - Ejemplos correctos: "para venta" → {{"quiere_cotizacion": true}}
+    - Ejemplos INCORRECTOS: {{"quiere_cotizacion": "sí"}}, {{"quiere_cotizacion": "no"}}
+    - IMPORTANTE: Solo extraer quiere_cotizacion si la última pregunta del bot es sobre cotización
+    
+    MÁQUINAS RECOMENDADAS ACTUALMENTE (lista ordenada por posición):
+    {maquinas_recomendadas_str}
+    
+    REGLAS ESPECIALES PARA MAQUINA_SELECCIONADA:
+    - Si el usuario selecciona una máquina específica, extrae el MODELO EXACTO COMPLETO en maquina_seleccionada.
+    - RESOLUCIÓN DE REFERENCIAS POSICIONALES (PRIORIDAD MÁXIMA):
+      Si hay máquinas recomendadas listadas arriba y el usuario indica una posición (por número, ordinal, o expresión equivalente), DEBES resolver la posición al nombre COMPLETO del modelo correspondiente de la lista.
+      * "la 1", "opción 1", "maquina 1", "número 1", "la primera", "el primero", "primera opción", "quiero la 1" → modelo en posición 1
+      * "la 2", "opción 2", "maquina 2", "la segunda", "segunda opción", "quiero la 2" → modelo en posición 2
+      * "la 3", "opción 3", "maquina 3", "la tercera", "quiero la 3" → modelo en posición 3
+    - NUNCA extraigas solo el número o la referencia posicional (ej. "1", "primera"). SIEMPRE resuelve al nombre completo del modelo.
+    - IMPORTANTE (ESTRICTO): Si el bot listó EXACTAMENTE UNA MÁQUINA y el usuario simplemente acepta ("esa opción", "la primera", "sí cotízame", "me interesa esa"), DEBES extraer el NOMBRE COMPLETO de esa máquina.
+    - Si el usuario menciona un nombre parcial de modelo (ej. "X-START"), extrae exactamente lo que dijo el usuario. La resolución al nombre completo se hará automáticamente.
+    - IMPORTANTE: Cuando el usuario selecciona una máquina (ya sea por posición, nombre o aceptación genérica), TAMBIÉN debes extraer quiere_cotizacion: true.
+    
+    Respuesta (solo JSON):
+    """
 )
-from machine_reference import (
-    MachineReference,
-    detect_machine_reference,
-    looks_like_machine_code,
+
+# ============================================================================
+# PROMPTS PARA GENERACIÓN DE RESPUESTA
+# ============================================================================
+
+RESPONSE_GENERATION_PROMPT = ChatPromptTemplate.from_template(
+    """
+    Eres Alphi, un asesor comercial en Alpha C y un asistente de ventas profesional especializado en maquinaria de la empresa.
+    Estás continuando una conversación con un lead.
+    Tu trabajo recolectar información de manera natural y conversacional, con un tono casual y amigable.
+
+    HISTORIAL DE CONVERSACIÓN:
+    {history_messages}
+
+    INFORMACIÓN EXTRAÍDA DEL ÚLTIMO MENSAJE:
+    {extracted_info_str}
+    
+    ESTADO ACTUAL DE LA CONVERSACIÓN:
+    {current_state_str}
+    
+    SIGUIENTE PREGUNTA A HACER: {next_question}
+
+    MENSAJE DEL USUARIO: {user_message}
+
+    IMPORTANTE:
+    {inventory_instruction}
+    {presentation_instruction}
+    {datos_empresa_instruction}
+    {tipo_ayuda_instruction}
+    {machine_reference_instruction}
+    {brand_instruction}
+    {company_instruction}
+    {coverage_instruction}
+
+    TIPOS DE MAQUINARIA VÁLIDOS (los ÚNICOS que Alpha C maneja):
+    {tipos_maquinaria_validos}
+
+    INSTRUCCIONES:
+    1. No repitas información que ya confirmaste anteriormente
+    2. {extracted_name_instruction}
+    3. Si hay una siguiente pregunta, hazla de manera natural
+    4. NO inventes preguntas adicionales
+    5. Si no hay siguiente pregunta, simplemente confirma la información recibida y termina la conversación
+    6. FORMATO: Cuando necesites pedir múltiples datos al usuario, SIEMPRE usa una lista enumerada (1. 2. 3.). NUNCA uses viñetas (•), guiones (-) ni párrafos corridos para listar datos que necesitas.
+    7. EXPRESIONES DE CONFIRMACIÓN: Usa MÁXIMO UNA expresión de confirmación por mensaje (ej: "Perfecto", "Muy bien", "Entiendo", "De acuerdo"). NO combines múltiples expresiones como "Perfecto... Claro...". Una expresión de confirmación SOLO es apropiada para reconocer información que el usuario te ACABA de dar o para aceptar una petición suya; NUNCA la uses después de RESPONDER una pregunta del usuario (por ejemplo, tras una pregunta de precio). En particular, NUNCA pegues una palabra como "Claro" justo antes de pedir datos: enlaza directamente con la transición.
+    8. PRECIOS: NUNCA reveles, inventes ni estimes el precio o costo de ninguna máquina en esta etapa. El precio se entrega ÚNICAMENTE en la cotización formal, después de que el usuario proporcione todos los datos solicitados. Si el usuario pregunta por el precio o costo, explícale de forma amable y breve que el precio se incluye en la cotización formal y que para generarla necesitas los datos que le estás pidiendo; luego continúa solicitando los datos pendientes. Bajo NINGUNA circunstancia menciones una cifra de precio.
+    8.1 PETICIONES POR PRECIO (comparativas): Si el usuario pide una opción EN FUNCIÓN DEL PRECIO (ej.: "la más barata", "la más económica", "la más accesible", "la más cara", "la de menor/mayor precio"), NO la rankees por precio ni insinúes qué máquina es más barata o más cara (aún no tienes acceso a los precios). Reconoce de forma breve su interés por el presupuesto, aclara que el precio se entrega en la cotización formal, y CONTINÚA pidiendo la especificación técnica que falte (ej.: el tipo de plataforma) para poder recomendar. NUNCA presentes una máquina como "la más barata" ni "la más cara".
+    9. TIPOS DE MAQUINARIA: Si el usuario pregunta qué máquinas o tipos manejan/tienen, enuméralos EXCLUSIVAMENTE a partir de la lista "TIPOS DE MAQUINARIA VÁLIDOS" de arriba. NUNCA menciones ni inventes tipos que no estén en esa lista (por ejemplo: taladros, retroexcavadoras, excavadoras, etc.). NO uses "entre otros" ni sugieras que existen más tipos de los listados.
+    9.1 LA EMPRESA: NUNCA confirmes una afirmación sobre Alpha C (ubicación, sucursales, países donde operamos, tamaño, antigüedad) solo porque el usuario la dio por hecha en su pregunta. La ÚNICA fuente válida es el bloque "QUIÉNES SOMOS" de arriba. Si te preguntan algo de la empresa que no está ahí, dile que un asesor se lo confirma; NO lo inventes.
+    10. MARCAS: NUNCA afirmes ni niegues que manejamos una marca por tu cuenta. La ÚNICA fuente válida es el bloque "DISPONIBILIDAD DE MARCAS" cuando aparezca arriba. Si el usuario menciona una marca y ese bloque NO está presente, NO digas que la manejamos ni que no la manejamos: continúa con la pregunta pendiente sin pronunciarte sobre la marca. PROHIBIDO decir "manejamos [marca]" si esa marca no aparece como disponible en ese bloque.
+
+    Genera una respuesta natural y apropiada:
+    """
 )
 
-langchain.debug = False
-langchain.verbose = False
-langchain.llm_cache = False
-
 # ============================================================================
-# CONFIGURACIÓN DE DEBUG
+# PROMPTS PARA INVENTARIO
 # ============================================================================
 
-# Variable global para controlar si se muestran los prints de DEBUG
-DEBUG_MODE = True
-
-def debug_print(*args, **kwargs):
+INVENTORY_DETECTION_PROMPT = ChatPromptTemplate.from_template(
     """
-    Función helper para imprimir mensajes de DEBUG solo cuando DEBUG_MODE es True
+    Eres un asistente especializado en identificar si un mensaje del usuario es una pregunta sobre inventario de maquinaria.
+    
+    TU TAREA:
+    Determinar si el mensaje del usuario es una pregunta sobre:
+    1. Disponibilidad de maquinaria
+    2. Tipos de maquinaria que vendemos
+    3. Modelos disponibles
+    4. Ubicaciones de entrega
+    5. Precios o cotizaciones
+    6. Características de la maquinaria
+    7. Cualquier consulta relacionada con el inventario
+    
+    REGLAS:
+    - Si es pregunta sobre inventario → true
+    - Si es respuesta a una pregunta del bot → false
+    - Si es información personal del usuario → false
+    - Si es pregunta general no relacionada → false
+    
+    EJEMPLOS DE PREGUNTAS SOBRE INVENTARIO:
+    - "¿Qué tipos de maquinaria tienen?"
+    - "¿Tienen soldadoras?"
+    - "¿Cuánto cuesta un compresor?"
+    - "¿En qué ubicaciones entregan?"
+    - "¿Qué modelos de generadores manejan?"
+    - "¿Tienen inventario disponible?"
+    - "¿Pueden cotizar una torre de iluminación?"
+    
+    EJEMPLOS DE NO INVENTARIO:
+    - "me llamo Juan"
+    - "quiero un compresor"
+    - "es para venta"
+    - "mi empresa se llama ABC"
+    
+    Mensaje del usuario: {message}
+    
+    Responde SOLO con "true" si es pregunta sobre inventario, o "false" si no lo es.
     """
-    if DEBUG_MODE:
-        logging.info(*args, **kwargs)
-
-# ============================================================================
-# INVENTARIO FAKE
-# ============================================================================
-
-def get_inventory():
-    return {
-        "tipo_maquinaria": [
-            "soldadora",
-            "compresor",
-            "torre_iluminacion",
-            "plataforma",
-            "generador",
-            "rompedor",
-            "apisonador",
-            "montacargas",
-            "manipulador"
-        ],
-        "modelo_maquinaria": "Cualquier modelo",
-        "ubicacion": "Cualquier ubicación en México",
-    }
-
-# ============================================================================
-# OBTENER EL ESTADO ACTUAL DE LOS CAMPOS EN UN STRING
-# ============================================================================
-
-def get_current_state_str(current_state: ConversationState) -> str:
-    """Obtiene el estado actual de los campos como una cadena de texto"""
-    field_names = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
-    fields_str = ""
-    for field in field_names:
-        if field == "detalles_maquinaria":
-            fields_str += f"- {field}: " + json.dumps(current_state.get(field) or {}) + "\n"
-        else:
-            value = current_state.get(field)
-            # Convert to string to handle boolean values like quiere_cotizacion
-            fields_str += f"- {field}: " + (str(value) if value is not None else "") + "\n"
-    return fields_str
-
-# ============================================================================
-# CONFIGURACIÓN DE AZURE OPENAI
-# ============================================================================
-
-class AzureOpenAIConfig:
-    """Clase para manejar la configuración de Azure OpenAI con diferentes configuraciones según el propósito"""
-    
-    def __init__(self, 
-                 endpoint: str,
-                 api_key: str,
-                 deployment_name: str,
-                 api_version: str = "2024-12-01-preview",
-                 model_name: str = "gpt-4.1-mini"):
-        self.endpoint = endpoint
-        self.api_key = api_key
-        self.deployment_name = deployment_name
-        self.api_version = api_version
-        self.model_name = model_name
-        
-        # Configurar variables de entorno para Azure OpenAI
-        os.environ["FOUNDRY_ENDPOINT"] = endpoint
-        os.environ["FOUNDRY_API_KEY"] = api_key
-        os.environ["OPENAI_API_VERSION"] = api_version
-    
-    def create_llm(self, temperature: float = 0.3, max_tokens: int = 1000, top_p: float = 1.0):
-        """Crea una instancia de AzureChatOpenAI con parámetros personalizados"""
-        return AzureChatOpenAI(
-            azure_endpoint=self.endpoint,
-            api_key=self.api_key,
-            azure_deployment=self.deployment_name,
-            api_version=self.api_version,
-            model_name=self.model_name,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            timeout=60,
-            max_retries=3,
-            verbose=True
-        )
-    
-    def create_extraction_llm(self):
-        """Crea un LLM optimizado para extracción de información (temperatura baja para mayor precisión)"""
-        return self.create_llm(
-            temperature=0.1,  # Temperatura muy baja para extracción precisa
-            top_p=0.9,        # Top-p moderado para consistencia
-            max_tokens=1000
-        )
-    
-    def create_conversational_llm(self):
-        """Crea un LLM optimizado para generación conversacional (temperatura alta para mayor creatividad)"""
-        return self.create_llm(
-            temperature=0.7,  # Temperatura alta para respuestas más creativas y variadas
-            top_p=0.95,       # Top-p alto para mayor diversidad
-            max_tokens=300
-        )
-    
-    def create_inventory_llm(self):
-        """Crea un LLM para responder preguntas sobre inventario (temperatura moderada)"""
-        return self.create_llm(
-            temperature=0.5,  # Temperatura moderada para balance entre precisión y creatividad
-            top_p=0.9,       # Top-p moderado
-            max_tokens=1000
-        )
-
-# ============================================================================
-# FUNCIONES HELPER
-# ============================================================================
-
-# Preguntas que YA son sobre la máquina. Si el lead manda un código mientras se
-# le pregunta una de estas, el código ES la respuesta y no hay digresión que
-# reconocer. En cualquier otra pregunta (nombre, apellido, datos de empresa) el
-# código interrumpe el flujo y hay que reconocerlo antes de re-preguntar.
-_MACHINERY_QUESTION_TYPES = {
-    "tipo_maquinaria",
-    "detalles_maquinaria",
-    "quiere_cotizacion",
-    "seleccion_maquina",
-}
-
-def _is_distribuidor(giro: str) -> bool:
-    """Verifica si el giro corresponde a un distribuidor basado en palabras clave."""
-    if not giro:
-        return False
-    g = giro.lower()
-    distributor_keywords = ["venta", "renta", "distribuidor", "reventa", "distribucion", "distribución"]
-    for keyword in distributor_keywords:
-        if keyword in g:
-            return True
-    return False
-
-def _is_compresor_estacionario(current_state: dict) -> bool:
-    """Verifica si el lead está solicitando un compresor estacionario.
-    En ese caso, el bot no cotiza automáticamente y deriva a un asesor."""
-    if current_state.get("tipo_maquinaria") != "compresor":
-        return False
-    detalles = current_state.get("detalles_maquinaria", {})
-    tipo_compresor = str(detalles.get("tipo_compresor", "")).lower()
-    return "estacionario" in tipo_compresor or "electrico" in tipo_compresor or "eléctrico" in tipo_compresor
-
-def _format_machine_details(machine: Dict[str, Any]) -> str:
-    """Extrae las características técnicas de una máquina en un string amigable."""
-    ignore_keys = {"modelo", "categoria", "id", "_rid", "_self", "_etag", "_attachments", "_ts", "precio", "moneda"}
-    details = []
-    for key, value in machine.items():
-        if key not in ignore_keys and value is not None and str(value).strip() != "":
-            # Convert keys: "altura_trabajo_m" -> "Altura Trabajo M"
-            label = " ".join(word.capitalize() for word in key.split("_"))
-            details.append(f"{label}: {value}")
-    
-    if details:
-        return f" ({', '.join(details)})"
-    return ""
-
-def get_pending_empresa_fields(current_state: ConversationState) -> List[str]:
-    """
-    Extrae los campos pendientes de la empresa según el flujo de venta o uso propio.
-    Retorna una lista con los labels de los campos que aún no han sido respondidos.
-    """
-    uso = current_state.get("tipo_cliente")
-    
-    # 1. Primer bloque: uso, correo, ubicacion
-    if not uso:
-        pending = ["si te dedicas a la venta/renta de maquinaria"]
-        if not current_state.get("correo"):
-            pending.append("correo electrónico")
-        if not current_state.get("lugar_requerimiento"):
-            pending.append("ubicación (estado de la República Mexicana)")
-        return pending
-
-    pending_basic = []
-    if not current_state.get("correo"):
-        pending_basic.append("correo electrónico")
-    if not current_state.get("lugar_requerimiento"):
-        pending_basic.append("ubicación (estado de la República Mexicana)")
-        
-    if uso == "distribuidor":
-        constancia = current_state.get("constancia_fiscal_entregada")
-        if constancia is None:
-            return pending_basic + ["Constancia de Situación Fiscal"]
-        elif constancia == "No tiene" or constancia is False:
-            giro = current_state.get("giro_empresa")
-            if not giro:
-                return pending_basic + ["Giro de la empresa"]
-            
-            is_distribuidor = _is_distribuidor(giro)
-            if is_distribuidor:
-                return pending_basic
-            else:
-                if not current_state.get("nombre_empresa"):
-                    return pending_basic + ["Nombre de la empresa"]
-                return pending_basic
-        else:
-            return pending_basic
-            
-    else: # uso == "cliente_final"
-        if not current_state.get("nombre_empresa"):
-            pending_basic.append("Nombre de la empresa")
-        if not current_state.get("giro_empresa"):
-            pending_basic.append("Giro de la empresa")
-            
-        return pending_basic
-
-# ============================================================================
-# SISTEMA DE SLOT-FILLING INTELIGENTE
-# ============================================================================
-
-class IntelligentSlotFiller:
-    """Sistema inteligente de slot-filling que detecta información ya proporcionada"""
-    
-    def __init__(self, azure_config: AzureOpenAIConfig):
-        self.llm = azure_config.create_extraction_llm()  # Usar LLM optimizado para extracción
-        self.parser = JsonOutputParser()
-    
-    def _parse_json_robust(self, text: str) -> dict:
-        """
-        Parsing robusto de JSON que maneja:
-        - JSON envuelto en bloques de código markdown (```json ... ```)
-        - Texto extra antes/después del JSON
-        - Respuestas con explicaciones antes del JSON
-        Retorna un dict o lanza una excepción si no se puede parsear.
-        """
-        if not text or not text.strip():
-            return {}
-        
-        original_text = text
-        text = text.strip()
-        
-        # 1. Intentar parseo directo
-        try:
-            result = json.loads(text)
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError:
-            pass
-        
-        # 2. Intentar extraer JSON de bloques de código markdown
-        code_block_match = re.search(r'```(?:json)?\s*\n?(\{[\s\S]*?\})\s*\n?```', text)
-        if code_block_match:
-            try:
-                result = json.loads(code_block_match.group(1))
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                pass
-        
-        # 3. Intentar encontrar la primera aparición de un objeto JSON { ... }
-        brace_match = re.search(r'(\{[\s\S]*\})', text)
-        if brace_match:
-            try:
-                result = json.loads(brace_match.group(1))
-                if isinstance(result, dict):
-                    return result
-            except json.JSONDecodeError:
-                pass
-        
-        # 4. Intentar con el parser de LangChain como último recurso
-        try:
-            result = self.parser.parse(original_text)
-            if isinstance(result, dict):
-                return result
-        except Exception:
-            pass
-        
-        raise ValueError(f"No se pudo extraer JSON válido del texto: {text[:200]}")
-        
-    def detect_negative_response(self, message: str, last_bot_question: Optional[str] = None) -> Optional[Dict[str, str]]:
-        """
-        Detecta si el usuario está dando una respuesta negativa o de incertidumbre.
-        Retorna un diccionario con el tipo de respuesta y el campo específico, o None si no es una respuesta negativa.
-        Formato: {"response_type": "No tiene" o "No especificado", "field": "nombre_del_campo"}
-        """
-        prompt = NEGATIVE_RESPONSE_PROMPT
-        
-        try:
-            # Obtener campos disponibles desde el FIELDS_CONFIG_PRIORITY
-            fields_available = self._get_fields_available_str()
-
-            response = self.llm.invoke(prompt.format_prompt(
-                message=message,
-                last_bot_question=last_bot_question or "No hay pregunta previa",
-                fields_available=fields_available
-            ))
-            
-            result = response.content.strip()
-            
-            # Verificar si es "None" (no es respuesta negativa)
-            if result.lower().strip('"\'') == "none":
-                return None
-            
-            # Intentar parsear como JSON con método robusto
-            try:
-                parsed_result = self._parse_json_robust(result)
-                if isinstance(parsed_result, dict) and "response_type" in parsed_result and "field" in parsed_result:
-                    return parsed_result
-                else:
-                    return None
-            except (ValueError, json.JSONDecodeError):
-                return None
-                
-        except Exception as e:
-            logging.error(f"Error detectando respuesta negativa: {e}")
-            return None
-
-    def extract_all_information(self, message: str, current_state: ConversationState, last_bot_question: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Extrae TODA la información disponible en un solo mensaje
-        Detecta qué slots se pueden llenar y cuáles ya están completos
-        Incluye el contexto de la última pregunta del bot para mejor interpretación
-        """
-        
-        # PRIMERO: Detectar si es una respuesta negativa o de incertidumbre
-        negative_response = self.detect_negative_response(message, last_bot_question)
-        
-        extracted_data = {}
-
-        if negative_response:
-            # Si es una respuesta negativa, guardar el campo y valor
-            field_name = negative_response.get("field")
-            response_type = negative_response.get("response_type")
-            
-            if field_name and response_type:
-                extracted_data[field_name] = response_type
-        
-        # SEGUNDO: Extraer el resto de la información usando el prompt general
-        # Crear prompt que considere el estado actual y la última pregunta del bot
-        prompt = EXTRACTION_PROMPT
-        
-        try:
-            # Nombres de tipos de maquinaria
-            # OBTENER DINÁMICAMENTE LOS NOMBRES DESDE LA CONFIGURACIÓN (Strings)
-            maquinaria_names = " ".join([f"\"{m.type_id}\"" for m in machinery_config_service.get_all_types()])
-
-            # Obtener campos disponibles desde el FIELDS_CONFIG_PRIORITY
-            fields_available = self._get_fields_available_str()
-
-            # Obtener campos específicos del tipo de maquinaria actual
-            machine_type = current_state.get("tipo_maquinaria")
-            machine_specific_fields = ""
-            
-            if machine_type:
-                # Validar dinámicamente si existe configuración
-                config = machinery_config_service.get_config(machine_type)
-                if config:
-                   field_instructions = []
-                   for field in config.fields:
-                       field_instructions.append(f"- Para {machine_type.upper()}: {field.name} ({field.question})")
-                   machine_specific_fields = "\n".join(field_instructions)
-            
-            if not machine_specific_fields:
-                machine_specific_fields = "- No hay un tipo de maquinaria seleccionado aún, o no hay configuración específica."
-
-            # Formatear la lista de máquinas recomendadas para el prompt
-            recomendadas = current_state.get("maquinas_recomendadas", [])
-            if recomendadas:
-                maquinas_lines = [f"  {i+1}. {modelo}" for i, modelo in enumerate(recomendadas)]
-                maquinas_recomendadas_str = "\n".join(maquinas_lines)
-            else:
-                maquinas_recomendadas_str = "  (No hay máquinas recomendadas aún)"
-
-            response = self.llm.invoke(prompt.format_prompt(
-                message=message,
-                current_state_str=get_current_state_str(current_state),
-                last_bot_question=last_bot_question or "No hay pregunta previa (inicio de conversación)",
-                maquinaria_names=maquinaria_names,
-                fields_available=fields_available,
-                machine_specific_fields=machine_specific_fields,
-                maquinas_recomendadas_str=maquinas_recomendadas_str
-            ))
-            
-            # Parsear la respuesta JSON con método robusto
-            raw_content = response.content
-            try:
-                general_extraction = self._parse_json_robust(raw_content)
-            except ValueError as parse_err:
-                logging.error(f"Error parseando JSON de extracción. Respuesta del LLM: '{raw_content[:300]}'. Error: {parse_err}")
-                general_extraction = {}
-            
-            # Fusionar resultados (la extracción general tiene prioridad si encuentra algo más específico,
-            # pero mantenemos la respuesta negativa si no hay conflicto o si es complementaria)
-            if isinstance(general_extraction, dict):
-                extracted_data.update(general_extraction)
-            
-            logging.info(f"Extracción completada. Mensaje: '{message[:50]}' → Datos: {json.dumps(extracted_data, ensure_ascii=False, default=str)}")
-            
-            # Lógica determinista de selección implícita
-            quiere_cot_new = extracted_data.get("quiere_cotizacion")
-            quiere_cot_curr = current_state.get("quiere_cotizacion")
-            is_quoting = quiere_cot_new is True or quiere_cot_curr is True
-            
-            if is_quoting and not extracted_data.get("maquina_seleccionada") and not current_state.get("maquina_seleccionada"):
-                recomendadas = current_state.get("maquinas_recomendadas", [])
-                if isinstance(recomendadas, list) and len(recomendadas) == 1:
-                    extracted_data["maquina_seleccionada"] = recomendadas[0]
-                    logging.info(f"Seleccionada automáticamente la única opción recomendada: {recomendadas[0]}")
-            
-            return extracted_data
-            
-        except Exception as e:
-            logging.error(f"Error extrayendo información: {e}")
-            import traceback
-            logging.error(f"Traceback: {traceback.format_exc()}")
-            return extracted_data
-    
-    def get_next_question(self, current_state: ConversationState) -> Optional[str]:
-        """
-        Determina inteligentemente cuál es la siguiente pregunta necesaria
-        siguiendo el flujo definido en el diagrama PlantUML.
-        """
-        try:
-            # 1. NOMBRE Y APELLIDO
-            # Verificar si tenemos el nombre
-            nombre = current_state.get("nombre")
-            if not nombre:
-                return {
-                    "question": FIELDS_CONFIG_PRIORITY["nombre"]["question"],
-                    "reason": FIELDS_CONFIG_PRIORITY["nombre"]["reason"],
-                    "question_type": "nombre"
-                }
-            
-            # Verificar si tenemos el apellido (o si el nombre ya incluye apellido)
-            apellido = current_state.get("apellido")
-            if not apellido and len(nombre.split()) < 2:
-                return {
-                    "question": FIELDS_CONFIG_PRIORITY["apellido"]["question"],
-                    "reason": FIELDS_CONFIG_PRIORITY["apellido"]["reason"],
-                    "question_type": "apellido"
-                }
-
-            # 2. TIPO DE AYUDA
-            tipo_ayuda = current_state.get("tipo_ayuda")
-            if not tipo_ayuda:
-                return {
-                    "question": FIELDS_CONFIG_PRIORITY["tipo_ayuda"]["question"],
-                    "reason": FIELDS_CONFIG_PRIORITY["tipo_ayuda"]["reason"],
-                    "question_type": "tipo_ayuda"
-                }
-            
-            # Si el tipo de ayuda es "otro", terminamos el flujo de preguntas
-            if tipo_ayuda == "otro":
-                return None
-
-            # 3. TIPO DE MAQUINARIA (Solo si tipo_ayuda es "maquinaria")
-            tipo_maquinaria = current_state.get("tipo_maquinaria")
-            if not tipo_maquinaria:
-                return {
-                    "question": FIELDS_CONFIG_PRIORITY["tipo_maquinaria"]["question"],
-                    "reason": FIELDS_CONFIG_PRIORITY["tipo_maquinaria"]["reason"],
-                    "question_type": "tipo_maquinaria"
-                }
-
-            # 4. DETALLES DE MAQUINARIA
-            # Verificar si faltan detalles específicos
-            if not self._are_maquinaria_details_complete(current_state):
-                question_details = self._get_maquinaria_detail_question_with_reason(current_state)
-                if question_details:
-                    return question_details
-
-            # 5. COTIZACIÓN / INVENTARIO
-            # Para compresores estacionarios: saltar recomendaciones, auto-set quiere_cotizacion y pasar a datos_empresa
-            if _is_compresor_estacionario(current_state):
-                if current_state.get("quiere_cotizacion") is None:
-                    current_state["quiere_cotizacion"] = True
-                # Saltar directamente a datos_empresa (paso 6)
-            else:
-                # Si no hemos recomendado máquinas aún, forzamos este paso para que se active la búsqueda de inventario.
-                quiere_cotizacion = current_state.get("quiere_cotizacion")
-                if not current_state.get("maquinas_recomendadas"):
-                    return {
-                        "question": FIELDS_CONFIG_PRIORITY["quiere_cotizacion"]["question"],
-                        "reason": FIELDS_CONFIG_PRIORITY["quiere_cotizacion"]["reason"],
-                        "question_type": "quiere_cotizacion"
-                    }
-            
-            # Si ya se recomendaron máquinas y el usuario no quiere cotización, terminamos
-            quiere_cotizacion = current_state.get("quiere_cotizacion")
-            if quiere_cotizacion is False:
-                return None
-
-            # 5.5 SELECCIÓN DE MÁQUINA (cuando hay múltiples opciones)
-            # Si el usuario dijo "sí" pero no especificó cuál máquina, re-preguntar
-            recomendadas = current_state.get("maquinas_recomendadas", [])
-            maquina_seleccionada = current_state.get("maquina_seleccionada")
-            if quiere_cotizacion is True and len(recomendadas) > 1 and not maquina_seleccionada:
-                machines_list = ""
-                for i, modelo in enumerate(recomendadas, 1):
-                    machines_list += f"{i}. {modelo}\n"
-                return {
-                    "question": f"Perfecto, estas son las opciones disponibles:\n{machines_list}\n¿Cuál de estas opciones te interesa?",
-                    "reason": "El usuario no especificó cuál máquina desea cotizar",
-                    "question_type": "seleccion_maquina"
-                }
-
-            # 6. DATOS DE EMPRESA
-            # Si quiere cotización o está pendiente, pedir datos de empresa si faltan
-            pending_fields = get_pending_empresa_fields(current_state)
-            if len(pending_fields) > 0:
-                return {
-                    "question": "Necesito los siguientes datos de su empresa para continuar con la cotización.",  # Mensaje explícito para evitar que el LLM piense que acabó
-                    "reason": "Para generar la cotización",
-                    "question_type": "datos_empresa"
-                }
-
-            # Si llegamos aquí, tenemos toda la información necesaria
-            return None
-            
-        except Exception as e:
-            logging.error(f"Error generando siguiente pregunta: {e}")
-            return None
-
-    def _get_fields_available_str(self) -> str:
-        """Obtiene los campos disponibles como una lista de strings con su descripción"""
-        fields_available = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
-        fields_available_str = ""
-        for field in fields_available:
-            fields_available_str += f"- {field}: " + FIELDS_CONFIG_PRIORITY[field]['description'] + "\n"
-        return fields_available_str
-    
-    def _get_contextual_required_fields(self, current_state: ConversationState) -> list:
-        """
-        Obtiene los campos requeridos para el tipo de maquinaria actual,
-        filtrando campos condicionales según el contexto.
-        Ej: tipo_alimentacion solo se requiere para plataformas articuladas.
-        """
-        tipo = current_state.get("tipo_maquinaria")
-        required_fields = get_required_fields_for_tipo(tipo)
-        
-        # Para plataformas, tipo_alimentacion solo aplica a "articulada"
-        if tipo == "plataforma":
-            detalles = current_state.get("detalles_maquinaria", {})
-            tipo_plataforma = detalles.get("tipo_plataforma", "")
-            if tipo_plataforma and tipo_plataforma != "articulada":
-                required_fields = [f for f in required_fields if f != "tipo_alimentacion"]
-                
-        # Para soldadoras, tipo_alimentacion NUNCA se pregunta:
-        # - amperaje ≤ 200: solo se recomienda la EGW185MS (gasolina) → no preguntar
-        # - amperaje > 200: todas las opciones son diésel → no preguntar
-        if tipo == "soldadora":
-            required_fields = [f for f in required_fields if f != "tipo_alimentacion"]
-        
-        # Para compresores estacionarios, saltar CFM (asesor se encarga)
-        if _is_compresor_estacionario(current_state):
-            required_fields = [f for f in required_fields if f != "caudal_cfm_max"]
-        
-        return required_fields
-
-    def _are_maquinaria_details_complete(self, current_state: ConversationState) -> bool:
-        """Verifica si todos los detalles de maquinaria están completos"""
-        tipo = current_state.get("tipo_maquinaria")
-        
-        if not tipo:
-            return False
-            
-        # Verificar si existe configuración para este tipo
-        if not machinery_config_service.get_config(tipo):
-            return False
-        
-        detalles = current_state.get("detalles_maquinaria", {})
-        required_fields = self._get_contextual_required_fields(current_state)
-        
-        return all(
-            field in detalles and 
-            detalles[field] is not None and 
-            detalles[field] != ""
-            for field in required_fields
-        )
-    
-    def _get_maquinaria_detail_question_with_reason(self, current_state: ConversationState) -> Optional[dict]:
-        """Obtiene la siguiente pregunta específica sobre detalles de maquinaria de manera conversacional con el motivo"""
-        
-        tipo = current_state.get("tipo_maquinaria")
-
-        config = machinery_config_service.get_config(tipo)
-        if not config:
-            return None
-
-        detalles = current_state.get("detalles_maquinaria", {})
-
-        # Obtener campos requeridos según contexto (ej: tipo_alimentacion solo para articulada)
-        contextual_required = self._get_contextual_required_fields(current_state)
-
-        # Buscar el primer campo de la configuración que no esté en los detalles
-        for field_info in config.fields:
-            field_name = field_info.name
-            # Saltar campos que no aplican en el contexto actual
-            if field_name not in contextual_required:
-                continue
-            if not detalles.get(field_name):
-                # Encontrado el siguiente campo a preguntar
-                # Devolver la pregunta fija definida en la configuración centralizada
-                return {
-                    "question": field_info.question, 
-                    "reason": field_info.reason, 
-                    "question_type": "detalles_maquinaria"
-                }
-
-        return None # Todos los detalles están completos
-    
-    def is_conversation_complete(self, current_state: ConversationState) -> bool:
-        """Verifica si la conversación está completa (todos los slots llenos)"""
-
-        # Verificar si el nombre tiene al menos dos palabras (nombre + apellido)
-        nombre = current_state.get("nombre", "")
-        if not nombre or len(nombre.split()) < 2:
-            return False
-
-        # Verificar tipo_ayuda
-        tipo_ayuda = current_state.get("tipo_ayuda")
-        if not tipo_ayuda:
-            return False
-        
-        # Si tipo_ayuda es "otro", solo se requiere nombre y apellido
-        if tipo_ayuda == "otro":
-            # Solo verificar nombre y apellido
-            nombre = current_state.get("nombre", "")
-            if not nombre or len(nombre.split()) < 2:
-                return False
-            
-            return True
-        
-        # Si tipo_ayuda es "maquinaria", verificar también tipo_maquinaria y detalles_maquinaria
-        # Obtener campos obligatorios desde el FIELDS_CONFIG_PRIORITY
-        required_fields = [field for field in FIELDS_CONFIG_PRIORITY.keys() if FIELDS_CONFIG_PRIORITY[field]["required"]]
-        
-        # Verificar campos básicos
-        for field in required_fields:
-            value = current_state.get(field)
-            if not value or value == "":
-                return False
-        
-        # Verificar tipo_maquinaria
-        tipo_maquinaria = current_state.get("tipo_maquinaria")
-        if not tipo_maquinaria:
-            return False
-        
-        # Verificar detalles de maquinaria
-        detalles = current_state.get("detalles_maquinaria", {})
-        
-        if not detalles:
-            return False
-        
-        # Usar la configuración centralizada para obtener campos obligatorios (con contexto)
-        required_fields = self._get_contextual_required_fields(current_state)
-        
-        if not all(
-            field in detalles and 
-            detalles[field] is not None and 
-            detalles[field] != ""
-            for field in required_fields
-        ):
-            return False
-
-        # Verificar si quiere cotización
-        quiere_cot = current_state.get("quiere_cotizacion")
-        if quiere_cot is None:
-            return False
-            
-        if quiere_cot is True:
-            # Reutilizamos get_pending_empresa_fields para validar
-            if len(get_pending_empresa_fields(current_state)) > 0:
-                return False
-            # Para cotización (excepto compresor estacionario), se requiere máquina seleccionada
-            if not _is_compresor_estacionario(current_state) and not current_state.get("maquina_seleccionada"):
-                return False
-
-        return True
-
-# ============================================================================
-# SISTEMA DE RESPUESTAS INTELIGENTES
-# ============================================================================
-
-class IntelligentResponseGenerator:
-    """Genera respuestas inteligentes basadas en el contexto y la información extraída"""
-    
-    def __init__(self, azure_config: AzureOpenAIConfig, cosmos_client=None, db_name=None):
-        self.llm = azure_config.create_conversational_llm()  # Usar LLM optimizado para conversación
-        self.inventory_service = InventoryService(cosmos_client, db_name)
-    
-    def generate_response(self, 
-        message: str, 
-        history_messages: List[Dict[str, Any]],
-        extracted_info: Dict[str, Any], 
-        current_state: ConversationState, 
-        next_question: str = None,
-        is_inventory_question: bool = False,
-        question_type: str = None,
-        machine_reference: Optional[MachineReference] = None
-    ) -> str:
-        """Genera una respuesta contextual apropiada usando un enfoque conversacional"""
-        
-        try:
-            # Crear prompt conversacional basado en el estilo de llm.py
-            # Crear prompt conversacional basado en el estilo de llm.py
-            prompt = RESPONSE_GENERATION_PROMPT
-
-            # Verificar si es el inicio de la conversación (menos de 2 elementos en history_messages)
-            is_initial_conversation = len(history_messages) < 2
-            
-            # Instrucción de presentación obligatoria si es el inicio
-            presentation_instruction = ""
-            if is_initial_conversation:
-                presentation_instruction = """
-                
-                PRESENTACIÓN:
-                Presentate como Alphi, asesor comercial de Alpha C.
-                Si en el primer mensaje del usuario este menciona que requiere algún producto o servicio, o solo quiere más información, dile "Hola, sí claro, puedo ayudarte con eso. Soy Alphi, asesor comercial de Alpha C." y luego haz la pregunta correspondiente.
-                Si el usuario NO menciona ninguna necesidad (solo saluda o se presenta), dile "Hola, soy Alphi, asesor comercial de Alpha C." y luego haz la pregunta correspondiente.
-                IMPORTANTE: SIEMPRE debes incluir tu nombre y cargo en el PRIMER mensaje.
-                """
-
-            # Instrucción para manejar el nombre y apellido del usuario
-            extracted_name_instruction = ""
-
-            # Preparar información extraída como string de manera más segura
-            if not extracted_info:
-                extracted_info_str = "Ninguna información nueva"
-            else:
-                # Filtrar información sensible antes de enviar
-                safe_info = {}
-                for key, value in extracted_info.items():
-                    if key in ['apellido', 'correo', 'telefono']:
-                        safe_info[key] = '[INFORMACIÓN PRIVADA]'
-                    else:
-                        safe_info[key] = value
-                extracted_info_str = json.dumps(safe_info, ensure_ascii=False, indent=2)
-
-                if extracted_info.get("nombre"):
-                    nombre = extracted_info.get("nombre")
-                    if is_initial_conversation:
-                        extracted_name_instruction = f"El usuario ya proporcionó su nombre ({nombre}). Úsalo amablemente en tu saludo, PERO NO dejes de presentarte tú primero."
-                    else:
-                        extracted_name_instruction = f"El usuario acaba de decir su nombre, así que responde con un 'Gracias, {nombre}.' Y haz la siguiente pregunta."
-                elif extracted_info.get("apellido"):
-                    if is_initial_conversation:
-                        extracted_name_instruction = "El usuario proporcionó su apellido. Tómalo en cuenta."
-                    else:
-                        extracted_name_instruction = "El usuario acaba de decir su apellido, así que responde con un 'Va.' Y haz la siguiente pregunta, no repitas el nombre ni apellido."
-                else:
-                    extracted_name_instruction = "No menciones el nombre ni apellido del usuario."
-
-            # Lista autorizada de tipos de maquinaria (nombres amigables). Fuente de
-            # verdad única; se inyecta SIEMPRE en el prompt para que el bot nunca
-            # invente tipos que no existen en el inventario.
-            tipos_maquinaria_validos = ", ".join(machinery_config_service.get_type_display_list())
-
-            # Marcas que pidió el lead, contrastadas contra el inventario. Es la
-            # ÚNICA fuente con la que el bot puede afirmar o negar una marca; sin
-            # esto el LLM improvisa y se contradice entre un mensaje y otro.
-            brand_evaluations = self._pending_brand_evaluations(current_state)
-
-            if is_inventory_question:
-                inventory_instruction = (
-                    "El mensaje del usuario incluye una pregunta sobre inventario. "
-                    "Enumérale los tipos de maquinaria que manejamos usando EXCLUSIVAMENTE la lista "
-                    "'TIPOS DE MAQUINARIA VÁLIDOS'. No agregues, parafrasees a otro producto ni inventes "
-                    "tipos que no estén en esa lista, y no uses 'entre otros'."
-                )
-            else:
-                inventory_instruction = "Sigue las instrucciones dadas."
-
-            # Instrucción especial para cuando se pregunta sobre cotización de maquinarias
-            if question_type == "quiere_cotizacion":
-                # START MODIFICATION: Lógica dinámica de recomendación
-                machine_type = current_state.get("tipo_maquinaria")
-                detalles = current_state.get("detalles_maquinaria", {})
-                
-                # Si el lead pidió una marca que SÍ manejamos en este tipo, la
-                # recomendación debe ser de esa marca: ofrecerle otra después de
-                # confirmarle que la tenemos se lee como que no lo escuchamos.
-                marcas_solicitadas_disponibles = [
-                    ev.marca for ev in brand_evaluations
-                    if ev.estatus == DISPONIBLE_EN_TIPO
-                ]
-
-                recommended_machines = []
-                if machine_type:
-                    recommended_machines = self.inventory_service.find_matching_machines(
-                        machine_type, detalles, brands=marcas_solicitadas_disponibles or None
-                    )
-
-                # Aclaración de marcas para este camino, que arma el texto sin LLM.
-                brand_disclaimer = build_brand_disclaimer(brand_evaluations)
-                if brand_evaluations:
-                    current_state["marcas_aclaradas"] = True
-                prefijo_marcas = f"{brand_disclaimer}\n\n" if brand_disclaimer else ""
-
-                if recommended_machines:
-                    # Formatear lista de máquinas recomendadas
-                    machines_list = ""
-                    recommended_models = []  # Lista de modelos para guardar en el estado
-                    for machine in recommended_machines: # Cantidad controlada por filtro de proximidad
-                         # Intentar construir un nombre descriptivo
-                        modelo = machine.get("modelo", "Modelo Desconocido")
-                        recommended_models.append(modelo)  # Guardar modelo
-                        cat = machine.get("categoria", "")
-                        
-                        # Agregar detalles clave según el tipo (simplificado)
-                        extra_info = _format_machine_details(machine)
-                        
-                        warning_msg = ""
-                        if machine.get("categoria") == "soldadora" and machine.get("amperaje_amps_max") == 185 and str(machine.get("tipo_alimentacion", "")).lower() == "gasolina":
-                            req_amp = detalles.get("amperaje_amps_max")
-                            if req_amp is not None:
-                                try:
-                                    if 185 < float(req_amp) <= 200:
-                                        warning_msg = " (Nota: Esta soldadora funcionará dependiendo del tipo de electrodo o la varilla a utilizar)"
-                                except ValueError:
-                                    pass
-                        
-                        # Nota para soldadoras de alto amperaje (400A y 500A) que soportan 2 usuarios simultáneos
-                        if machine.get("categoria") == "soldadora" and machine.get("amperaje_amps_max", 0) >= 390:
-                            warning_msg += " (Nota: Esta soldadora tiene la ventaja de poder ser utilizada por 2 usuarios al mismo tiempo)"
-                        
-                        # NOTE: Prices are NOT shown in recommendations.
-                        machines_list += f"- {modelo}{extra_info}{warning_msg}\n"
-                    
-                    # Guardar la lista de modelos recomendados en el estado
-                    current_state["maquinas_recomendadas"] = recommended_models
-                    
-                    intro_recomendacion = "la siguiente opción disponible" if len(recommended_models) == 1 else "las siguientes opciones disponibles"
-                    # Tras la aclaración de marcas, un "Muy bien" suena a que se
-                    # celebró la mala noticia; se enlaza directo.
-                    apertura = "Basándome" if prefijo_marcas else "Muy bien, basándome"
-
-                    if current_state.get("quiere_cotizacion") is True:
-                        cierre_cotizacion = "Para la cotización que solicitaste, ¿te interesa esta opción?" if len(recommended_models) == 1 else "Para la cotización que solicitaste, ¿te interesa alguna de estas opciones?"
-                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
-{machines_list}
-
-{cierre_cotizacion}"""
-                    else:
-                        cierre_cotizacion = "¿Te gustaría recibir una cotización formal por esta?" if len(recommended_models) == 1 else "¿Te gustaría recibir una cotización formal por alguna de estas?"
-                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
-{machines_list}
-{cierre_cotizacion}"""
-                else:
-                     # Fallback si no hay coincidencias exactas
-                    # Con aclaración de marcas previa, el "Entendido." sobra.
-                    entendido = "" if prefijo_marcas else "Entendido. "
-                    if current_state.get("quiere_cotizacion") is True:
-                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
-                    else:
-                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
-
-¿Te gustaría que un asesor te contacte para ofrecerte una solución personalizada?"""
-                # END MODIFICATION
-
-            # Si la pregunta es de selección de máquina (re-preguntar cuál opción quiere),
-            # devolver directamente el texto con la lista numerada sin pasar por el LLM
-            if question_type == "seleccion_maquina":
-                return next_question
-            
-            # Instrucción especial para datos_empresa
-            datos_empresa_instruction = ""
-            pending_fields = []
-            if question_type == "datos_empresa":
-                pending_fields = get_pending_empresa_fields(current_state)
-                if not pending_fields:
-                    return ""
-                
-                # Agregar instrucción específica para datos_empresa
-                datos_empresa_instruction = """
-                
-                INSTRUCCIÓN ESPECIAL PARA RECOPILAR DATOS:
-                PASO 1 (OBLIGATORIO): Si el usuario hace una pregunta o comentario, PRIMERO respóndele de forma breve y natural. Por ejemplo, si pregunta sobre estados de entrega, ubicaciones, características, etc., responde a su duda con la información que tengas. EXCEPCIÓN: si pregunta por el precio o costo, NO se lo digas ni inventes una cifra; explícale de forma amable que el precio se incluye en la cotización formal y que para generarla necesitas los datos que le estás solicitando.
-                PASO 2: Después de responder, haz una transición natural para pedir los datos pendientes. La transición NO debe empezar con una expresión de confirmación ("Claro", "Perfecto", "Por supuesto", etc.); enlaza directamente con la petición.
-                - Usa un mensaje como: """
-                should_list_pending_fields = False
-                uso = current_state.get("tipo_cliente")
-                
-                if not uso and "si te dedicas a la venta/renta de maquinaria" in pending_fields:
-                    # Construir lista enumerada de campos pendientes
-                    numbered_items = []
-                    numbered_items.append("¿Te dedicas a la venta o renta de maquinaria?")
-                    if "correo electrónico" in pending_fields:
-                        numbered_items.append("Correo electrónico")
-                    if "ubicación (estado de la República Mexicana)" in pending_fields:
-                        numbered_items.append("Estado de la República Mexicana")
-                    numbered_list = "\n".join([f"{i+1}. {item}" for i, item in enumerate(numbered_items)])
-                    datos_empresa_instruction += f"""Para avanzar con la cotización necesito algunos datos de tu empresa.
-{numbered_list}"""
-                
-                elif "Constancia de Situación Fiscal" in pending_fields and len(pending_fields) == 1:
-                    datos_empresa_instruction += "Pide ÚNICAMENTE la Constancia de Situación Fiscal. EXPRESAMENTE PROHIBIDO pedir otro dato como nombre de empresa, teléfono o correo. Usa este mensaje exacto: 'Perfecto, para poder brindarle un precio preferencial como distribuidor, le pido de favor que me comparta por este medio su Constancia de Situación Fiscal.'"
-                
-                elif pending_fields == ["Giro de la empresa"]:
-                    datos_empresa_instruction += "Pregunta ÚNICAMENTE por el giro de la empresa usando un mensaje como: 'Para continuar, ¿me podrías indicar cuál es el giro de tu empresa?' No uses viñetas."
-                    should_list_pending_fields = False
-                    
-                elif pending_fields == ["Nombre de la empresa"]:
-                    datos_empresa_instruction += "Pregunta ÚNICAMENTE por el nombre de la empresa usando un mensaje como: 'Para generar la cotización, ¿me podrías indicar el nombre de tu empresa?' No uses viñetas."
-                    should_list_pending_fields = False
-
-                else:
-                    dato_str = "estos datos" if len(pending_fields) > 1 else "este dato"
-                    datos_empresa_instruction += f"También necesito {dato_str}:"
-                    should_list_pending_fields = True
-                
-                if should_list_pending_fields:
-                    pending_fields_numbered = "\n".join([f"{i+1}. {f}" for i, f in enumerate(pending_fields)])
-                    datos_empresa_instruction += f"""
-                - Menciona EXPLÍCITAMENTE los campos que faltan en una LISTA ENUMERADA (1. 2. 3.) y pídelos en este mismo mensaje, en este orden:
-{pending_fields_numbered}
-                - NUNCA uses viñetas (•) ni guiones (-). SIEMPRE usa números (1. 2. 3.).
-                - Si el usuario ya contestó alguno de estos campos en su último mensaje, NO lo repitas ni lo vuelvas a pedir.
-                - NUNCA inventes campos adicionales (por ejemplo: teléfono) si no están en la lista.
-                - IMPORTANTE: NO te despidas, NO cierres la conversación.
-                    """
-                else:
-                    datos_empresa_instruction += """
-                - NUNCA menciones los campos pendientes en tu respuesta, solo responde con la introducción
-                - NUNCA menciones información que se extrajo previamente, ni confirmes la información recién extraída, a menos de que el usuario lo pregunte
-                - IMPORTANTE: NO te despidas, NO digas 'Perfecto, con esto terminamos', NO digas 'Gracias por la información' como cierre.
-                - Debes dejar claro que FALTAN datos y que la conversación continúa.
-                    """
-
-            tipo_ayuda_instruction = ""
-            if question_type == "tipo_ayuda":
-                tipo_ayuda_instruction = "IMPORTANTÍSIMO: Cuando vayas a preguntar en qué le puedes ayudar al usuario, EXCLUSIVAMENTE usa la frase: '¿En qué te puedo ayudar?' de forma literal y directa, sin agregar texto adicional a la pregunta."
-
-            machine_reference_instruction = self._build_machine_reference_instruction(
-                machine_reference, next_question, question_type
-            )
-
-            brand_instruction = self._build_brand_instruction(brand_evaluations)
-            if brand_instruction:
-                # Ya se le entregó al LLM la verdad sobre las marcas pedidas: no
-                # hay que volver a aclararlas en los turnos siguientes.
-                current_state["marcas_aclaradas"] = True
-
-            current_state_str = get_current_state_str(current_state)
-            formatedPrompt = prompt.format_prompt(
-                user_message=message,
-                current_state_str=current_state_str,
-                history_messages=history_messages,
-                extracted_info_str=extracted_info_str,
-                next_question=next_question or "No hay siguiente pregunta",
-                inventory_instruction=inventory_instruction,
-                presentation_instruction=presentation_instruction,
-                extracted_name_instruction=extracted_name_instruction,
-                datos_empresa_instruction=datos_empresa_instruction,
-                tipo_ayuda_instruction=tipo_ayuda_instruction,
-                machine_reference_instruction=machine_reference_instruction,
-                brand_instruction=brand_instruction,
-                tipos_maquinaria_validos=tipos_maquinaria_validos
-            )
-
-            debug_print(f"DEBUG: Prompt conversacional: {formatedPrompt}")
-            
-            response = self.llm.invoke(formatedPrompt)
-            
-            result = response.content.strip()
-            debug_print(f"DEBUG: Respuesta conversacional generada: '{result}'")
-            
-            # Ya no agreamos la lista de campos pendientes hardcoded,
-            # porque el LLM ya incorpora la pregunta dentro del propio texto.
-            
-            return result
-            
-        except Exception as e:
-            logging.error(f"Error generando respuesta conversacional: {e}")
-            # Fallback a la lógica simple si no se puede generar la respuesta
-            if next_question:
-                return next_question
-            else:
-                return "En un momento le responderemos."
-    
-    def _pending_brand_evaluations(self, current_state: ConversationState) -> List[BrandAvailability]:
-        """
-        Marcas pedidas por el lead que el bot todavía NO le ha aclarado,
-        evaluadas contra el inventario y contra el tipo de maquinaria vigente.
-
-        Se re-evalúan cada turno en lugar de guardarse ya resueltas porque el
-        tipo de maquinaria suele llegar DESPUÉS de la marca: el mismo "solo
-        marca Dewalt" significa una cosa antes de saber que quiere un rompedor y
-        otra después.
-        """
-        if current_state.get("marcas_aclaradas"):
-            return []
-
-        marcas = current_state.get("marcas_solicitadas") or []
-        if not marcas:
-            return []
-
-        return evaluate_brand_names(marcas, current_state.get("tipo_maquinaria"))
-
-    def _build_brand_instruction(self, brand_evaluations: List[BrandAvailability]) -> str:
-        """
-        Inyecta al LLM lo que el inventario dice de las marcas que pidió el lead.
-
-        Sin esto el LLM inventa: en una misma conversación llegó a decir
-        "manejamos rompedores Dewalt y Makita" y luego lo contrario.
-        """
-        if not brand_evaluations:
-            return ""
-
-        facts = build_brand_facts(brand_evaluations)
-        if not facts:
-            return ""
-
-        hay_no_disponibles = any(
-            ev.estatus != DISPONIBLE_EN_TIPO for ev in brand_evaluations
-        )
-        instruccion_negativa = (
-            """
-                - Dilo de forma clara y directa, sin rodeos y sin disculpas largas: el lead necesita
-                  saber que no la tenemos para no seguir esperándola.
-                - Inmediatamente después ofrécele lo que SÍ manejamos en el tipo que busca, usando
-                  EXCLUSIVAMENTE las marcas listadas arriba.
-                - PROHIBIDO prometer que la conseguiremos, que la podemos pedir o que llegará después."""
-            if hay_no_disponibles else
-            """
-                - Confírmaselo de forma breve, sin exagerar ni prometer disponibilidad inmediata,
-                  stock, tiempos de entrega ni precio."""
-        )
-
-        return f"""
-                DISPONIBILIDAD DE MARCAS (VERDAD ABSOLUTA - PRIORIDAD MÁXIMA):
-                El lead preguntó por marcas específicas. Esto es lo que dice nuestro inventario
-                REAL y es la ÚNICA fuente válida sobre marcas:
-{facts}
-                REGLAS OBLIGATORIAS:
-                - Responde a la marca ANTES de continuar con la pregunta pendiente. No la ignores.{instruccion_negativa}
-                - PROHIBIDO afirmar o insinuar que manejamos una marca que arriba diga "NO la manejamos".
-                - PROHIBIDO mencionar cualquier otra marca que no aparezca en la lista de arriba.
-                - No inventes modelos, características ni precios de ninguna marca.
-                - Después de aclarar la marca, en el MISMO mensaje enlaza con la pregunta pendiente.
-                """
-
-    def _build_machine_reference_instruction(
-        self,
-        machine_reference: Optional[MachineReference],
-        next_question: Optional[str],
-        question_type: Optional[str]
-    ) -> str:
-        """
-        Construye la instrucción para reconocer la máquina que mencionó el lead
-        antes de re-preguntar el dato pendiente.
-
-        Solo aplica cuando el código INTERRUMPE el flujo: hay una pregunta
-        pendiente y NO es una pregunta sobre la máquina (en ese caso el código es
-        la respuesta, no una digresión).
-        """
-        if not machine_reference or not next_question:
-            return ""
-
-        if question_type in _MACHINERY_QUESTION_TYPES:
-            return ""
-
-        if machine_reference.en_inventario and machine_reference.modelo:
-            contexto = (
-                f"Ese código corresponde a la {machine_reference.modelo} "
-                f"({machine_reference.categoria}), que sí manejamos. Puedes referirte a ella "
-                "por su nombre, pero NO afirmes disponibilidad, precio ni características técnicas."
-            )
-        else:
-            contexto = (
-                f"Ese código corresponde a un equipo del tipo '{machine_reference.categoria}'. "
-                "NO afirmes que manejamos ese modelo exacto (no está en nuestro inventario), "
-                "pero tampoco lo niegues: solo reconoce el interés."
-            )
-
-        return f"""
-                RECONOCIMIENTO DE LA MÁQUINA MENCIONADA (PRIORIDAD ALTA):
-                El usuario mencionó el código/modelo de una máquina ("{machine_reference.texto}")
-                en lugar de responder la pregunta pendiente. {contexto}
-                PROHIBIDO repetir la pregunta pendiente en seco: se lee como si no lo hubieras leído.
-                PASO 1 (OBLIGATORIO): Reconoce su interés en UNA sola frase breve, con este patrón:
-                "Entiendo que te interesa esa máquina, pero primero..."
-                PASO 2: En el MISMO mensaje, enlaza de inmediato con la pregunta pendiente.
-                - NO uses otra expresión de confirmación ("Perfecto", "Claro") además de este reconocimiento.
-                - NO inventes datos técnicos, precios ni tiempos de entrega de ese modelo.
-                - Ejemplo de tono: "Entiendo que te interesa esa máquina, pero primero, ¿con quién tengo el gusto?"
-                """
-
-    def generate_final_response(self, current_state: ConversationState) -> str:
-        """Genera la respuesta final cuando la conversación está completa"""
-        
-        uso = current_state.get("tipo_cliente")
-        constancia = current_state.get("constancia_fiscal_entregada")
-        giro = current_state.get("giro_empresa", "")
-        
-        is_advisor_handoff = False
-        if uso == "distribuidor":
-            if constancia and constancia != "No tiene":
-                is_advisor_handoff = True
-            elif (constancia == "No tiene" or constancia is False) and giro and _is_distribuidor(giro):
-                is_advisor_handoff = True
-                
-        if is_advisor_handoff:
-            return "En un momento te contactará el asesor de la zona para darle el precio preferencial."
-        
-        # Compresores estacionarios: siempre handoff a asesor especializado
-        if _is_compresor_estacionario(current_state):
-            return f"Gracias por tu información, {current_state.get('nombre', 'Usuario')}. Un asesor especializado en compresores estacionarios se comunicará contigo para profundizar al respecto."
-
-        from pricing_service import get_pricing_service
-        
-        # Fetch price for the selected machine only
-        pricing_str = ""
-        maquina_seleccionada = current_state.get("maquina_seleccionada")
-        
-        logging.info(f"[PRICING_DEBUG] generate_final_response: maquina_seleccionada = '{maquina_seleccionada}'")
-        
-        if maquina_seleccionada:
-            try:
-                pricing_service = get_pricing_service()
-                logging.info(f"[PRICING_DEBUG] generate_final_response: pricing_service.is_available() = {pricing_service.is_available()}")
-                price_info = pricing_service.get_price(maquina_seleccionada)
-                
-                logging.info(f"[PRICING_DEBUG] generate_final_response: price_info = {price_info}")
-                
-                if price_info:
-                    precio = price_info["price"]
-                    moneda = price_info.get("currency", "USD")
-                    pricing_str = f"\n\nMáquina seleccionada:\n- {maquina_seleccionada}: ${precio:,.0f} {moneda}"
-                    logging.info(f"[PRICING_DEBUG] generate_final_response: Price FOUND - ${precio:,.0f} {moneda}")
-                else:
-                    # Sin precio en la base: NO se cotiza ni se envía PDF; se deriva a un asesor.
-                    logging.warning(f"[PRICING_DEBUG] generate_final_response: No price found for '{maquina_seleccionada}'. Deriving to advisor (no quotation/PDF).")
-                    return self._no_price_handoff_message(current_state)
-            except Exception as e:
-                logging.error(f"[PRICING_DEBUG] generate_final_response: EXCEPTION fetching price: {type(e).__name__}: {e}")
-                import traceback
-                logging.error(f"[PRICING_DEBUG] generate_final_response: Traceback: {traceback.format_exc()}")
-                # Ante un error obteniendo el precio tampoco arriesgamos enviar una
-                # cotización sin precio: derivamos a un asesor.
-                return self._no_price_handoff_message(current_state)
-        
-        return f"""¡Perfecto, {current_state.get('nombre', 'Usuario')}!{pricing_str}
-
-Procederé a generar su cotización."""
-
-    def _no_price_handoff_message(self, current_state: ConversationState) -> str:
-        """
-        Mensaje final cuando la máquina seleccionada NO tiene precio en la base.
-        En este caso NO se genera cotización ni se envía el PDF: un asesor
-        contactará al cliente para darle la cotización.
-        """
-        nombre = current_state.get("nombre", "Usuario")
-        return (
-            f"Gracias por tu información, {nombre}. "
-            "Un asesor se pondrá en contacto contigo para brindarte la cotización."
-        )
-
-# ============================================================================
-# RESPONDEDOR DE INVENTARIO
-# ============================================================================
-
-class InventoryResponder:
-    """Responde preguntas sobre el inventario de maquinaria"""
-    
-    def __init__(self, azure_config: AzureOpenAIConfig):
-        self.llm = azure_config.create_inventory_llm()  # Usar LLM optimizado para inventario
-        self.inventory = get_inventory() # TODO: Mover esto también a DB si es necesario, por ahora usa el fake
-
-    def is_inventory_question(self, message: str) -> bool:
-        """Determina si el mensaje del usuario es una pregunta sobre el inventario"""
-        try:
-            prompt = INVENTORY_DETECTION_PROMPT
-            
-            response = self.llm.invoke(prompt.format_prompt(
-                message=message
-            ))
-            
-            result = response.content.strip().lower()
-            
-            debug_print(f"DEBUG: ¿Es pregunta sobre inventario? '{message}' → {result}")
-            
-            return result == "true"
-            
-        except Exception as e:
-            logging.error(f"Error detectando pregunta de inventario: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-# ============================================================================
-# CLASE PRINCIPAL DEL CHATBOT CON SLOT-FILLING INTELIGENTE
-# ============================================================================
-
-class IntelligentLeadQualificationChatbot:
-    """Chatbot con slot-filling inteligente que detecta información ya proporcionada"""
-    
-    def __init__(self, azure_config: AzureOpenAIConfig, state_store: Optional[ConversationStateStore] = None, send_message_callback=None, send_pdf_callback=None, cosmos_client=None, db_name=None):
-        self.azure_config = azure_config
-        # Crear instancias con configuraciones específicas para cada propósito
-        self.slot_filler = IntelligentSlotFiller(azure_config)
-        self.response_generator = IntelligentResponseGenerator(azure_config, cosmos_client, db_name)
-        self.inventory_responder = InventoryResponder(azure_config)
-        
-        # Usar el state_store proporcionado o crear uno en memoria por defecto
-        self.state_store = state_store or InMemoryStateStore()
-        self.current_user_id = None
-        
-        # Callback para enviar mensajes por WhatsApp
-        self.send_message_callback = send_message_callback
-        
-        # Callback para enviar PDFs por WhatsApp
-        self.send_pdf_callback = send_pdf_callback
-        
-        # El estado local sigue existiendo para compatibilidad con código existente
-        self.state = self._create_empty_state()
-
-        # Referencia a máquina detectada en el mensaje del turno actual (si hubo)
-        self._machine_ref: Optional[MachineReference] = None
-
-    def _create_empty_state(self) -> ConversationState:
-        """Crea un estado vacío"""
-        state = {
-            # Campos que no se preguntan al usuario
-            "completed": False,
-            "cotizacion_enviada": False,  # True cuando ya se envió la respuesta final (evita ciclo)
-            "messages": [],
-            "conversation_mode": "bot", # agente o bot
-            "asignado_asesor": None,
-            "hubspot_contact_id": None,
-            "quiere_cotizacion": None,
-            "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
-            "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
-            "marcas_solicitadas": [],  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
-            "marcas_aclaradas": False  # True cuando el bot ya le respondió sobre esas marcas
-        }
-        
-        # Agregamos los campos que se preguntan al usuario desde el FIELDS_CONFIG_PRIORITY
-        fields_to_ask = [field for field in FIELDS_CONFIG_PRIORITY.keys()]
-        for field in fields_to_ask:
-            if field == "detalles_maquinaria":
-                state[field] = {}
-            else:
-                state[field] = None
-
-
-        return state
-    
-    def load_conversation(self, user_id: str):
-        """Carga la conversación de un usuario específico"""
-        logging.info(f"Cargando conversación para usuario {user_id}")
-        self.current_user_id = user_id
-        stored_state = self.state_store.get_conversation_state(user_id)
-        
-        if stored_state:
-            self.state = stored_state
-            debug_print(f"DEBUG: Estado cargado para usuario {user_id}")
-        else:
-            logging.info(f"No hay estado existente para usuario {user_id}, creando nuevo estado")
-            self.state = self._create_empty_state()
-            debug_print(f"DEBUG: Nuevo estado creado para usuario {user_id}")
-
-    def save_conversation(self):
-        """Guarda el estado actual de la conversación"""
-        if self.current_user_id:
-            self.state_store.save_conversation_state(self.current_user_id, self.state)
-            debug_print(f"DEBUG: Estado guardado para usuario {self.current_user_id}")
-
-    def reset_conversation(self):
-        """Reinicia el estado de la conversación"""
-        if self.current_user_id:
-            self.state_store.delete_conversation_state(self.current_user_id)
-        self.state = self._create_empty_state()
-    
-    def _get_final_response_message(self) -> str:
-        """
-        Determina el mensaje final basado en el tipo_ayuda del estado actual.
-        Retorna un mensaje diferente si el usuario necesita algo diferente a maquinaria.
-        """
-        tipo_ayuda = self.state.get("tipo_ayuda")
-        if tipo_ayuda == "otro":
-            return "Claro, en un momento te comparto la información."
-        else:
-            return "Gracias por la información. Pronto te contactará nuestro asesor especializado."
-    
-    def send_message(self, user_message: str, whatsapp_message_id: str = None, hubspot_manager: HubSpotManager = None) -> str:
-        """
-        Procesa un mensaje del usuario con slot-filling inteligente.
-        Si hubspot_manager es None, no se actualiza el contacto en HubSpot (para poder usar test_chatbot.py)
-        """
-        
-        try:
-            debug_print(f"DEBUG: send_message llamado con mensaje: '{user_message}'")
-            
-            # Si el mensaje está vacío, no hacer nada y esperar al usuario
-            if not user_message or not user_message.strip():
-                return None
-            
-            # Mensaje que se regresa
-            contextual_response = ""
-            
-            # Agregar mensaje del usuario
-            self.state["messages"].append({
-                "role": "user", 
-                "whatsapp_message_id": whatsapp_message_id,
-                "content": user_message,
-                "question_type": "",
-                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "sender": "lead"
-            })
-
-            # Extraer TODA la información disponible del mensaje (SIEMPRE)
-            # Obtener la última pregunta del bot para contexto
-            last_bot_question, _ = self._get_last_bot_question()
-            extracted_info = self.slot_filler.extract_all_information(user_message, self.state, last_bot_question)
-            debug_print(f"DEBUG: Información extraída: {extracted_info}")
-
-            # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
-            # ANTES de actualizar HubSpot y el estado para que el tipo de maquinaria
-            # inferido llegue a los dos.
-            self._machine_ref = self._detect_and_merge_machine_reference(user_message, extracted_info)
-
-            # Registrar las marcas que pidió el lead para poder confirmarlas o
-            # negarlas contra el inventario al generar la respuesta.
-            self._detect_and_store_brands(user_message)
-
-            # Actualizar el contacto en HubSpot
-            if hubspot_manager:
-                hubspot_manager.update_contact(self.state, extracted_info)
-
-            # Actualizar el estado con la información extraída
-            self._update_state_with_extracted_info(extracted_info)
-
-            # Verificar modo de conversación antes de generar respuesta
-            current_mode = self.state.get("conversation_mode", "bot")
-            
-            if current_mode == "agente":
-                # Modo agente: solo guardar estado, no generar respuesta automática
-                debug_print(f"DEBUG: Modo agente activo, no generando respuesta automática")
-                self.save_conversation()
-                return None  # No response en modo agente
-            
-            return self._process_and_respond(user_message, extracted_info)
-        
-        except Exception as e:
-            logging.error(f"Error procesando mensaje: {e}")
-            return "Disculpe, hubo un error técnico. ¿Podría intentar de nuevo?"
-
-    def _wants_pdf_resend(self, message: str) -> bool:
-        """Detecta si el usuario pide explícitamente re-enviar la cotización PDF."""
-        if self.state.get("tipo_cliente") == "distribuidor":
-            return False  # Distribuidores no reciben PDF, se les asigna asesor
-        keywords = ["cotización", "cotizacion", "pdf", "mándame", "mandame",
-                    "envíame", "enviame", "reenvía", "reenvia", "otra vez",
-                    "de nuevo", "vuelve a enviar", "manda otra"]
-        msg_lower = message.lower()
-        return any(kw in msg_lower for kw in keywords)
-
-    def _detect_and_merge_machine_reference(
-        self, user_message: str, extracted_info: Dict[str, Any]
-    ) -> Optional[MachineReference]:
-        """
-        Detecta el código/modelo de máquina que mencionó el lead y aprovecha lo
-        que revela: guarda el código para no perderlo y, si aún no sabemos el
-        tipo de maquinaria, lo deduce de la categoría del código.
-
-        Devuelve la referencia detectada (o None) para que la generación de
-        respuesta pueda reconocerla antes de re-preguntar el dato pendiente.
-        """
-        ref = detect_machine_reference(user_message)
-        if not ref:
-            return None
-
-        debug_print(f"DEBUG: Referencia a máquina detectada: {ref}")
-
-        # Guardar el código tal como lo escribió el lead para que no se pierda.
-        # Solo el primero: de ahí en adelante manda el flujo normal de maquinaria.
-        if not self.state.get("maquina_mencionada"):
-            self.state["maquina_mencionada"] = ref.texto
-
-        # Si no sabemos el tipo de maquinaria, la categoría del código lo resuelve:
-        # un lead que manda "PDSG900VR" quiere un compresor, no hace falta
-        # preguntárselo. Se inyecta en extracted_info (en lugar de escribir el
-        # estado directo) para que apliquen las validaciones de
-        # _update_state_with_extracted_info y para que el dato llegue a HubSpot.
-        if not extracted_info.get("tipo_maquinaria") and not self.state.get("tipo_maquinaria"):
-            extracted_info["tipo_maquinaria"] = ref.categoria
-            debug_print(
-                f"DEBUG: tipo_maquinaria='{ref.categoria}' inferido del código '{ref.texto}'"
-            )
-
-        return ref
-
-    def _detect_and_store_brands(self, user_message: str) -> None:
-        """
-        Guarda en el estado las marcas que pidió el lead.
-
-        Solo DETECTA y acumula; la evaluación contra el inventario se hace al
-        generar la respuesta, cuando el estado ya tiene el tipo de maquinaria
-        (el lead suele decir la marca antes de decir qué máquina quiere).
-
-        Mencionar una marca reabre SIEMPRE la aclaración, aunque ya se le haya
-        respondido antes: si el lead vuelve a preguntar es porque necesita la
-        respuesta otra vez. La bandera `marcas_aclaradas` solo evita repetir la
-        aclaración en los turnos donde el lead ya no habla de marcas.
-        """
-        mentions = detect_brand_mentions(user_message)
-        if not mentions:
-            return
-
-        marcas = list(self.state.get("marcas_solicitadas") or [])
-        for mention in mentions:
-            marca = canonical_brand(mention)
-            if marca.lower() not in [m.lower() for m in marcas]:
-                marcas.append(marca)
-
-        self.state["marcas_solicitadas"] = marcas
-        self.state["marcas_aclaradas"] = False
-        debug_print(f"DEBUG: Marcas solicitadas por el lead: {marcas}")
-
-    def _process_and_respond(self, user_message: str, extracted_info: Dict[str, Any]) -> str:
-        """
-        Lógica común para procesar un mensaje y generar una respuesta.
-        Detecta preguntas de inventario, verifica si la conversación está completa,
-        obtiene la siguiente pregunta y genera la respuesta con LLM.
-        """
-
-        # ── Manejo de mensajes de seguimiento en conversaciones ya completadas ──
-        # Si la respuesta final (cotización/asesor) ya fue enviada, no repetirla.
-        # En su lugar, responder de forma natural con el LLM.
-        if self.state.get("cotizacion_enviada"):
-            debug_print("DEBUG: Conversación ya completada y cotización ya enviada. Respondiendo naturalmente.")
-            history_messages = [{"role": msg["role"], "content": msg["content"]} for msg in self.state["messages"]]
-
-            # Permitir re-envío de PDF si el cliente_final lo pide explícitamente
-            if self._wants_pdf_resend(user_message):
-                debug_print("DEBUG: El usuario pidió re-enviar la cotización PDF.")
-                pdf_sent = self._try_send_pdf_quotation()
-                if pdf_sent:
-                    response = "¡Claro! Te reenvío la cotización."
-                else:
-                    # No hay PDF que reenviar (p. ej. la máquina no tiene precio):
-                    # no prometemos una cotización; reiteramos la derivación a asesor.
-                    response = "Tu cotización la está gestionando un asesor, quien se pondrá en contacto contigo para brindártela."
-                return self._add_message_and_return_response(response, "")
-
-            generated_response = self.response_generator.generate_response(
-                user_message,
-                history_messages,
-                extracted_info,
-                self.state,
-                next_question=None,
-                is_inventory_question=False,
-                question_type="conversation_complete"
-            )
-            return self._add_message_and_return_response(generated_response, "")
-
-        # ── Flujo normal ──
-        is_inventory_question = False
-
-        # Verificar si es una pregunta sobre inventario
-        if self.inventory_responder.is_inventory_question(user_message):
-            debug_print(f"DEBUG: Pregunta sobre inventario detectada")
-            is_inventory_question = True
-        
-        # Si no es pregunta de inventario ni de requerimientos, continuar con el flujo normal
-        debug_print(f"DEBUG: Flujo normal de calificación de leads...")
-
-        # Preparar historial de mensajes para el LLM
-        history_messages = [{
-            "role": msg["role"],
-            "content": msg["content"]
-        } for msg in self.state["messages"]]
-
-        next_question_str = None
-        next_question_type = "conversation_complete"
-        # Por defecto, si la conversación está completa, guardamos tipo vacío o un marcador
-        storage_question_type = "" 
-
-        # 1. Verificar si la conversación YA estaba marcada como completa o cumple condiciones
-        if self.slot_filler.is_conversation_complete(self.state):
-            debug_print(f"DEBUG: Conversación completa!")
-            self.state["completed"] = True
-            # Se usan los valores por defecto (None, conversation_complete)
-        
-        else:
-            # 2. Si no está completa, buscar siguiente pregunta
-            next_question_data = self.slot_filler.get_next_question(self.state)
-
-            if next_question_data is None:
-                debug_print(f"DEBUG: Estado completo (sin siguiente pregunta): {self.state}")
-                
-                # Caso especial: Si el usuario dijo "no" a la cotización
-                quiere_cot = self.state.get("quiere_cotizacion")
-                if quiere_cot is False:
-                    self.state["completed"] = True
-                    final_message = "Okay, ¿hay algo más en lo que te pueda ayudar?"
-                    return self._add_message_and_return_response(final_message, "")
-                
-                self.state["completed"] = True
-                # Se usan los valores por defecto
-            else:
-                # 3. Hay una siguiente pregunta
-                next_question_str = next_question_data["question"]
-                next_question_type = next_question_data['question_type']
-                storage_question_type = next_question_type
-
-                debug_print(f"DEBUG: Siguiente pregunta: {next_question_str}")
-                debug_print(f"DEBUG: Tipo de siguiente pregunta: {next_question_type}")
-
-        # If conversation is complete, use the final response with prices
-        if self.state.get("completed") and next_question_str is None:
-            # Caso "otro" (refacciones, créditos, consultas): NO se cotiza ni se envía PDF.
-            # Según el flujo, se confirma y se deriva a un asesor que continúa la conversación.
-            if self.state.get("tipo_ayuda") == "otro":
-                final_response = self._get_final_response_message()
-                self.state["cotizacion_enviada"] = True  # Marcar que la respuesta final ya fue enviada
-                return self._add_message_and_return_response(final_response, storage_question_type)
-
-            final_response = self.response_generator.generate_final_response(self.state)
-            self.state["cotizacion_enviada"] = True  # Marcar que la respuesta final ya fue enviada
-            result = self._add_message_and_return_response(final_response, storage_question_type)
-
-            # Generate and send PDF quotation if applicable
-            self._try_send_pdf_quotation()
-
-            # Send ficha técnica (technical datasheet) if available
-            self._try_send_ficha_tecnica()
-
-            return result
-
-        # Generar respuesta con LLM (Llamada unificada)
-        generated_response = self.response_generator.generate_response(
-            user_message, 
-            history_messages,
-            extracted_info, 
-            self.state, 
-            next_question=next_question_str,
-            is_inventory_question=is_inventory_question,
-            question_type=next_question_type,
-            machine_reference=self._machine_ref
-        )
-
-        return self._add_message_and_return_response(generated_response, storage_question_type)
-        
-    def _add_message_and_return_response(self, response: str, question_type: str) -> str:
-        """
-        Añade un mensaje al estado y devuelve la respuesta final
-        Si es un mensaje del bot y hay callback disponible, envía por WhatsApp primero
-        """
-        whatsapp_message_id = ""
-        
-        # Enviar mensaje por WhatsApp primero
-        try:
-            whatsapp_message_id = self.send_message_callback(self.current_user_id, response)
-            debug_print(f"DEBUG: Mensaje enviado por WhatsApp con ID: {whatsapp_message_id}")
-        except Exception as e:
-            debug_print(f"DEBUG: Error enviando mensaje por WhatsApp: {e}")
-            # Continuar sin el ID si hay error
-        
-        # Crear el mensaje con el ID de WhatsApp       
-        self.state["messages"].append({
-            "role": "assistant", 
-            "whatsapp_message_id": whatsapp_message_id,
-            "question_type": question_type,
-            "content": response,
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "sender": "bot"
-        })
-        
-        # Al final, guardar el estado
-        self.save_conversation()
-
-        return response
-
-    def _try_send_pdf_quotation(self) -> bool:
-        """
-        Attempts to generate and send a PDF quotation via WhatsApp.
-        Only triggers when:
-        - conversation is completed
-        - quiere_cotizacion is True
-        - maquina_seleccionada is set (and has a price)
-        - send_pdf_callback is available (running in WhatsApp context)
-
-        Returns True only if the PDF was actually sent; False otherwise
-        (skipped conditions, no price for the machine, or send failure).
-        """
-        try:
-            # Check conditions
-            # Guardia de negocio: el precio (que va dentro del PDF) NUNCA debe salir
-            # antes de que el lead haya proporcionado todos sus datos. Defensa en
-            # profundidad por si este método se invoca fuera del bloque `completed`.
-            if not self.state.get("completed"):
-                logging.info("[PDF] Skipping PDF: conversation not completed (price must not leak before all data is collected)")
-                return False
-
-            if not self.state.get("quiere_cotizacion"):
-                logging.info("[PDF] Skipping PDF: quiere_cotizacion is not True")
-                return False
-
-            if self.state.get("tipo_cliente") == "distribuidor":
-                logging.info("[PDF] Skipping PDF: uso is 'distribuidor', handoff triggered instead.")
-                return False
-            
-            maquina = self.state.get("maquina_seleccionada")
-            if not maquina:
-                logging.info("[PDF] Skipping PDF: no maquina_seleccionada in state")
-                return False
-            
-            if not self.send_pdf_callback:
-                logging.info("[PDF] Skipping PDF: no send_pdf_callback (test mode)")
-                return False
-            
-            if not self.current_user_id:
-                logging.warning("[PDF] Skipping PDF: no current_user_id set")
-                return False
-            
-            logging.info(f"[PDF] Starting PDF generation for machine: {maquina}, user: {self.current_user_id}")
-            
-            # Get price info
-            from pricing_service import get_pricing_service
-            price_info = None
-            try:
-                pricing_service = get_pricing_service()
-                price_info = pricing_service.get_price(maquina)
-                logging.info(f"[PDF] Price info retrieved: {price_info}")
-            except Exception as e:
-                logging.warning(f"[PDF] Could not fetch price for PDF: {e}")
-
-            # Sin precio: NO se envía la cotización en PDF; un asesor dará la cotización.
-            if not price_info:
-                logging.info(f"[PDF] Skipping PDF quotation: no price for '{maquina}' (advisor will provide the quote)")
-                return False
-
-            # Generate PDF
-            from pdf_service import get_pdf_generator
-            generator = get_pdf_generator()
-            pdf_bytes = generator.generate(self.state, price_info)
-            logging.info(f"[PDF] PDF generated successfully, size: {len(pdf_bytes)} bytes")
-            
-            # Build filename
-            safe_machine_name = maquina.replace(" ", "_").replace("/", "-")
-            filename = f"Cotizacion_{safe_machine_name}.pdf"
-            
-            # Send via WhatsApp
-            logging.info(f"[PDF] Sending PDF '{filename}' to {self.current_user_id}")
-            result = self.send_pdf_callback(self.current_user_id, pdf_bytes, filename)
-            
-            if result:
-                logging.info(f"[PDF] PDF quotation sent successfully. WhatsApp message_id: {result}")
-                return True
-            else:
-                logging.error(f"[PDF] send_pdf_callback returned None/empty for {self.current_user_id}")
-                return False
-
-        except Exception as e:
-            logging.error(f"[PDF] Error generating/sending PDF quotation: {e}")
-            import traceback
-            logging.error(f"[PDF] Traceback: {traceback.format_exc()}")
-            return False
-
-    def _try_send_ficha_tecnica(self):
-        """
-        Attempts to download and send the ficha técnica (technical datasheet)
-        PDF for the selected machine via WhatsApp.
-        Triggers for both regular customers AND distributors when:
-        - maquina_seleccionada is set
-        - A ficha técnica exists for that model in Blob Storage
-        - send_pdf_callback is available (running in WhatsApp context)
-        """
-        try:
-            maquina = self.state.get("maquina_seleccionada")
-            if not maquina:
-                logging.info("[FICHA] Skipping ficha técnica: no maquina_seleccionada")
-                return
-
-            if not self.send_pdf_callback:
-                logging.info("[FICHA] Skipping ficha técnica: no send_pdf_callback (test mode)")
-                return
-
-            if not self.current_user_id:
-                logging.warning("[FICHA] Skipping ficha técnica: no current_user_id")
-                return
-
-            from blob_storage_service import get_blob_storage_service
-            blob_service = get_blob_storage_service()
-
-            if not blob_service.has_ficha_tecnica(maquina):
-                logging.info(f"[FICHA] No ficha técnica available for {maquina}")
-                return
-
-            result = blob_service.get_ficha_tecnica(maquina)
-            if not result:
-                logging.error(f"[FICHA] Failed to download ficha técnica for {maquina}")
-                return
-
-            pdf_bytes, blob_filename = result
-
-            # Send introductory message
-            intro_message = "Te comparto la ficha técnica de la máquina que te interesó."
-            try:
-                wa_msg_id = self.send_message_callback(self.current_user_id, intro_message)
-                self.state["messages"].append({
-                    "role": "assistant",
-                    "whatsapp_message_id": wa_msg_id or "",
-                    "question_type": "",
-                    "content": intro_message,
-                    "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "sender": "bot"
-                })
-                # Persistir el intro ANTES de mandar el PDF: el envío del documento
-                # registra su propio mensaje en Cosmos, y save_conversation solo
-                # persiste el último mensaje nuevo.
-                self.save_conversation()
-            except Exception as e:
-                logging.error(f"[FICHA] Error sending intro message: {e}")
-
-            # Send the PDF
-            send_result = self.send_pdf_callback(self.current_user_id, pdf_bytes, blob_filename)
-
-            if send_result:
-                logging.info(f"[FICHA] Ficha técnica sent for {maquina}. WhatsApp message_id: {send_result}")
-            else:
-                logging.error(f"[FICHA] Failed to send ficha técnica for {maquina}")
-
-            # Save conversation with new messages
-            self.save_conversation()
-
-        except Exception as e:
-            logging.error(f"[FICHA] Error sending ficha técnica: {e}")
-            import traceback
-            logging.error(f"[FICHA] Traceback: {traceback.format_exc()}")
-    
-    # Alias de llaves de detalle que a veces produce la extracción -> campo canónico.
-    _DETALLE_ALIASES = {
-        "plataforma": {"altura_plataforma_m": "altura_trabajo_m"},
-    }
-
-    def _normalize_detalles_maquinaria(self, detalles: Dict[str, Any], tipo: Optional[str]) -> Dict[str, Any]:
-        """
-        Normaliza un dict de detalles de maquinaria al esquema canónico del tipo:
-        1) Remapea alias conocidos (ej. altura_plataforma_m -> altura_trabajo_m).
-        2) Descarta llaves que no existan en la config del tipo.
-        Si no hay tipo o no hay config, devuelve los detalles sin filtrar (evita
-        perder datos cuando aún no se conoce el tipo).
-        """
-        if not isinstance(detalles, dict) or not detalles or not tipo:
-            return detalles if isinstance(detalles, dict) else {}
-
-        result = dict(detalles)
-
-        # 1) Remapear alias conocidos sin pisar un valor canónico ya presente.
-        for alias, canonical in self._DETALLE_ALIASES.get(tipo, {}).items():
-            if alias in result:
-                if canonical not in result:
-                    result[canonical] = result[alias]
-                del result[alias]
-
-        # 2) Descartar llaves no canónicas (solo si conocemos la config del tipo).
-        config = machinery_config_service.get_config(tipo)
-        if config:
-            valid_fields = {f.name for f in config.fields}
-            dropped = [k for k in list(result.keys()) if k not in valid_fields]
-            for k in dropped:
-                del result[k]
-            if dropped:
-                debug_print(f"DEBUG: Detalles descartados por no ser canónicos de '{tipo}': {dropped}")
-
-        return result
-
-    def _update_state_with_extracted_info(self, extracted_info: Dict[str, Any]):
-        """
-        Actualiza el estado con la información extraída, confiando en el
-        pre-procesamiento y formato realizado por el LLM.
-        """
-        debug_print(f"DEBUG: Actualizando estado con información: {extracted_info}")
-
-        # Pre-check: si la conversación ya estaba completada y llega nueva info de maquinaria,
-        # reiniciar el flujo de cotización (mantiene datos de empresa).
-        # Esto permite: "también cotízame un generador de 35 kw" tras completar otra cotización.
-        if self.state.get("completed"):
-            has_new_machinery_request = (
-                "tipo_maquinaria" in extracted_info
-                or ("detalles_maquinaria" in extracted_info and isinstance(extracted_info["detalles_maquinaria"], dict) and len(extracted_info["detalles_maquinaria"]) > 0)
-            )
-            if has_new_machinery_request:
-                debug_print("DEBUG: Conversación completada recibe nueva solicitud de maquinaria. Reiniciando flujo de cotización.")
-                new_tipo = extracted_info.get("tipo_maquinaria")
-                old_tipo = self.state.get("tipo_maquinaria")
-                # Si es el mismo tipo, limpiar detalles para que se llenen con los nuevos
-                # Si es diferente tipo, la lógica de tipo_maquinaria más abajo también limpia
-                if not new_tipo or new_tipo == old_tipo:
-                    self.state["detalles_maquinaria"] = {}
-                self.state["maquinas_recomendadas"] = []
-                self.state["maquina_seleccionada"] = None
-                self.state["quiere_cotizacion"] = None
-                self.state["completed"] = False
-                self.state["cotizacion_enviada"] = False
-
-        # Si el usuario CAMBIA un detalle de la maquinaria DESPUÉS de que ya se
-        # recomendaron opciones (ej: pasa de 300A a 185A), los requerimientos
-        # cambiaron y la recomendación previa quedó obsoleta. Invalida la
-        # recomendación/selección y vuelve a pedir cotización para recalcular las
-        # NUEVAS opciones. Sin esto, el flujo podría completarse con una selección
-        # obsoleta/nula y nunca re-presentar la opción correcta.
-        if not self.state.get("completed") and self.state.get("maquinas_recomendadas"):
-            # Normalizar a los campos canónicos del tipo ANTES de comparar. Sin esto,
-            # una llave no-canónica (ej. altura o "interior/exterior" en montacargas)
-            # se veía como "detalle nuevo" y reseteaba recomendación/selección en cada
-            # turno, dejando el flujo inestable. Solo un cambio REAL en un campo canónico
-            # (capacidad, combustible, etc.) debe invalidar la recomendación previa.
-            tipo_actual = extracted_info.get("tipo_maquinaria") or self.state.get("tipo_maquinaria")
-            new_detalles = self._normalize_detalles_maquinaria(extracted_info.get("detalles_maquinaria"), tipo_actual)
-            if isinstance(new_detalles, dict) and new_detalles:
-                current_detalles = self.state.get("detalles_maquinaria", {}) or {}
-                # Detectar si CAMBIA un detalle existente (ej. 300A -> 185A) o si se
-                # AGREGA uno nuevo que afina la búsqueda (ej. el usuario por fin
-                # especifica el tipo de plataforma). En ambos casos los requerimientos
-                # cambiaron y la recomendación previa quedó obsoleta.
-                details_changed = any(
-                    current_detalles.get(k) != v
-                    for k, v in new_detalles.items()
-                )
-                if details_changed:
-                    debug_print("DEBUG: Detalles de maquinaria cambiaron tras recomendar. Recalculando recomendación y re-pidiendo cotización.")
-                    self.state["maquinas_recomendadas"] = []
-                    self.state["maquina_seleccionada"] = None
-                    self.state["quiere_cotizacion"] = None
-                    self.state["completed"] = False
-                    # Evitar que un quiere_cotizacion mal interpretado en ESTE mismo
-                    # mensaje (ej: "sabes qué, mejor de 185A" leído como "no") termine
-                    # el flujo antes de re-presentar las nuevas opciones.
-                    extracted_info.pop("quiere_cotizacion", None)
-
-        # Guardia determinista: si el LLM extrajo tipo_cliente="distribuidor" y giro_empresa
-        # en la misma extracción, eliminar giro_empresa. Según el flujo de conversación,
-        # el giro solo se pregunta DESPUÉS de que el distribuidor dice que no tiene la constancia.
-        # Cuando el usuario dice "nos dedicamos a la renta de maquinaria" para responder si se
-        # dedica a la venta/renta, eso solo debe setear tipo_cliente, no giro_empresa.
-        if (extracted_info.get("tipo_cliente") == "distribuidor" 
-            and "giro_empresa" in extracted_info
-            and not self.state.get("tipo_cliente")):
-            giro_value = extracted_info["giro_empresa"]
-            if _is_distribuidor(giro_value):
-                del extracted_info["giro_empresa"]
-                debug_print(f"DEBUG: Eliminado giro_empresa='{giro_value}' de extracción simultánea con tipo_cliente='distribuidor'. El giro se preguntará por separado.")
-
-        for key, value in extracted_info.items():
-            # 1. Ignorar valores nulos o vacíos para no insertar datos inútiles.
-            if value is None or value == "":
-                continue
-
-            # 1.5 Guardia: el código de una máquina NUNCA es el nombre, apellido o
-            # giro del lead. Cuando el lead responde con un código en lugar de
-            # contestar (ej. "PDSG900VR" a "¿Con quién tengo el gusto?"), el LLM a
-            # veces lo clasifica como nombre. Guardarlo contaminaría el estado y el
-            # contacto de HubSpot con un dato falso imposible de corregir después.
-            if key in ("nombre", "apellido", "giro_empresa") and looks_like_machine_code(value):
-                logging.warning(
-                    f"Descartado '{key}'='{value}': parece el código de una máquina, no un dato del lead."
-                )
-                continue
-
-            # 2. No sobrescribir campos que ya tienen un valor válido a excepción de:
-            # - detalles_maquinaria: se actualiza múltiples veces porque tiene varios subcampos.
-            # - quiere_cotizacion: puede cambiar si el usuario corrige su respuesta.
-            # - maquina_seleccionada: puede cambiar si el usuario elige otra máquina.
-            # - tipo_maquinaria: puede cambiar si el usuario cambia de opinión.
-            # - giro_empresa: el usuario puede corregirlo (ej: "en realidad nos dedicamos a la construcción").
-            # - tipo_cliente: puede cambiar por reclasificación (distribuidor → cliente_final).
-            # Esto es clave para evitar que una respuesta ambigua posterior
-            # borre un dato que ya se había confirmado.
-            current_value = self.state.get(key)
-            if key not in ["detalles_maquinaria", "quiere_cotizacion", "maquina_seleccionada", "tipo_maquinaria", "giro_empresa", "tipo_cliente"] and current_value:
-                debug_print(f"DEBUG: Campo '{key}' ya tiene valor válido '{current_value}', no se sobrescribe.")
-                continue
-
-            # 3. Manejo de casos especiales
-            if key == "detalles_maquinaria" and isinstance(value, dict):
-                # Normalizar a los campos canónicos del tipo actual: remapear alias
-                # conocidos (ej. altura_plataforma_m -> altura_trabajo_m) y descartar
-                # llaves que no estén en la config del tipo. Evita que una llave mal
-                # extraída bloquee el flujo (el campo requerido quedaría vacío y el
-                # bot re-preguntaría indefinidamente).
-                tipo_actual = extracted_info.get("tipo_maquinaria") or self.state.get("tipo_maquinaria")
-                value = self._normalize_detalles_maquinaria(value, tipo_actual)
-                current_detalles = self.state.get("detalles_maquinaria", {})
-                current_detalles.update(value)
-                self.state["detalles_maquinaria"] = current_detalles
-                debug_print(f"DEBUG: Detalles de maquinaria actualizados: {self.state['detalles_maquinaria']}")
-            
-            elif key == "tipo_maquinaria":
-                # Validar dinámicamente si el tipo existe en la configuración
-                config = machinery_config_service.get_config(value)
-                if config:
-                    old_tipo = self.state.get("tipo_maquinaria")
-                    self.state[key] = value
-                    debug_print(f"DEBUG: Campo '{key}' actualizado a: {value}")
-                    
-                    # Si el tipo de maquinaria CAMBIÓ, limpiar campos relacionados
-                    if old_tipo and old_tipo != value:
-                        debug_print(f"DEBUG: Tipo de maquinaria cambió de '{old_tipo}' a '{value}'. Limpiando detalles, recomendaciones y selección.")
-                        self.state["detalles_maquinaria"] = {}
-                        self.state["maquinas_recomendadas"] = []
-                        self.state["maquina_seleccionada"] = None
-                        self.state["quiere_cotizacion"] = None
-                        self.state["completed"] = False
-                else:
-                    logging.error(f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM.")
-            
-            elif key == "apellido":
-                # Combinar nombre y apellido en el campo nombre
-                nombre_actual = self.state.get("nombre", "")
-                if nombre_actual and value:
-                    self.state["nombre"] = f"{nombre_actual} {value}".strip()
-                    self.state["apellido"] = value 
-                    debug_print(f"DEBUG: Nombre y apellido combinados: '{self.state['nombre']}'")
-                else:
-                    self.state[key] = value
-                    debug_print(f"DEBUG: Campo '{key}' actualizado con valor: '{value}'")
-            
-            # 4. Para todos los demás campos, la actualización es directa.
-            # Se confía en que el LLM ya formateó la respuesta según las reglas del prompt.
-            else:
-                self.state[key] = value
-                debug_print(f"DEBUG: Campo '{key}' actualizado con valor: '{value}'")
-        
-        # Lógica de inferencia post-extracción
-        # Si tenemos tipo_maquinaria pero no tipo_ayuda, inferimos que es "maquinaria"
-        if self.state.get("tipo_maquinaria") and not self.state.get("tipo_ayuda"):
-            self.state["tipo_ayuda"] = "maquinaria"
-            debug_print("DEBUG: Inferido tipo_ayuda='maquinaria' basado en presencia de tipo_maquinaria")
-        
-        # Si el LLM extrajo maquina_seleccionada, inferir quiere_cotizacion=True
-        # (seleccionar una máquina implica querer cotización)
-        if self.state.get("maquina_seleccionada") and not self.state.get("quiere_cotizacion"):
-            self.state["quiere_cotizacion"] = True
-            debug_print("DEBUG: Inferido quiere_cotizacion=True por selección de máquina")
-        
-        # Inferencia determinista de tipo_cliente basada en palabras clave.
-        # El LLM a veces no extrae tipo_cliente de frases claras como "es para uso propio".
-        # Este fallback garantiza que frases inequívocas se clasifiquen correctamente.
-        if not self.state.get("tipo_cliente") and not extracted_info.get("tipo_cliente"):
-            # Obtener el último mensaje del usuario para analizar
-            user_messages = [m for m in self.state.get("messages", []) if m.get("role") == "user"]
-            if user_messages:
-                last_user_msg = user_messages[-1].get("content", "").lower().strip()
-                
-                # Palabras clave para cliente_final
-                cliente_final_keywords = [
-                    "uso propio", "uso de la empresa", "uso interno", "para mi empresa",
-                    "para nuestra empresa", "para la empresa", "no me dedico",
-                    "no nos dedicamos", "no, es para", "cliente final", "cliente_final"
-                ]
-                # Palabras clave para distribuidor
-                distribuidor_keywords = [
-                    "sí me dedico", "si me dedico", "me dedico a la venta",
-                    "me dedico a la renta", "para venta", "para reventa",
-                    "para distribución", "para distribucion", "soy distribuidor"
-                ]
-                
-                for kw in cliente_final_keywords:
-                    if kw in last_user_msg:
-                        self.state["tipo_cliente"] = "cliente_final"
-                        debug_print(f"DEBUG: Inferido tipo_cliente='cliente_final' por palabra clave '{kw}' en mensaje: '{last_user_msg}'")
-                        break
-                
-                if not self.state.get("tipo_cliente"):
-                    for kw in distribuidor_keywords:
-                        if kw in last_user_msg:
-                            self.state["tipo_cliente"] = "distribuidor"
-                            debug_print(f"DEBUG: Inferido tipo_cliente='distribuidor' por palabra clave '{kw}' en mensaje: '{last_user_msg}'")
-                            break
-        
-        # Inferencia determinista de giro_empresa basada en contexto de la pregunta.
-        # Cuando el bot preguntó "¿cuál es el giro de tu empresa?" y el usuario respondió,
-        # pero el LLM no extrajo giro_empresa (a veces lo confunde con tipo_cliente),
-        # seteamos giro_empresa directamente del mensaje del usuario.
-        if not self.state.get("giro_empresa") and not extracted_info.get("giro_empresa"):
-            last_bot_question, last_question_type = self._get_last_bot_question()
-            if last_bot_question and "giro" in last_bot_question.lower():
-                user_messages = [m for m in self.state.get("messages", []) if m.get("role") == "user"]
-                if user_messages:
-                    last_user_msg = user_messages[-1].get("content", "").strip()
-                    # Si el lead contestó con el código de una máquina en vez del giro,
-                    # NO tomarlo como giro: se re-preguntará y el bot reconocerá la máquina.
-                    if (last_user_msg
-                            and len(last_user_msg) < 100  # Respuesta razonable, no un párrafo largo
-                            and not looks_like_machine_code(last_user_msg)):
-                        self.state["giro_empresa"] = last_user_msg
-                        debug_print(f"DEBUG: Inferido giro_empresa='{last_user_msg}' por contexto de pregunta sobre giro.")
-
-        # Reclasificar distribuidor → cliente_final cuando:
-        # - El usuario dijo que se dedica a la venta/renta (tipo_cliente="distribuidor")
-        # - Pero NO tiene la Constancia de Situación Fiscal
-        # - Y su giro de empresa NO es de distribución/venta/renta de maquinaria
-        # En este caso, el usuario realmente es un cliente final que usa la maquinaria
-        # para su propio negocio (ej: construcción), así que se le cotiza directamente.
-        if (self.state.get("tipo_cliente") == "distribuidor"
-            and (self.state.get("constancia_fiscal_entregada") == "No tiene" or self.state.get("constancia_fiscal_entregada") is False)
-            and self.state.get("giro_empresa")
-            and not _is_distribuidor(self.state.get("giro_empresa"))):
-            self.state["tipo_cliente"] = "cliente_final"
-            debug_print(f"DEBUG: Reclasificado de distribuidor a cliente_final. Giro '{self.state.get('giro_empresa')}' no es de distribución y no tiene constancia fiscal.")
-        
-        # Resolve partial model names against recommended machines
-        # e.g. "X-START" → "Trime X-START", "DGM250MK-D" → "Shindaiwa DGM250MK-D"
-        maquina_sel = self.state.get("maquina_seleccionada")
-        maquinas_recomendadas = self.state.get("maquinas_recomendadas", [])
-        if maquina_sel:
-            partial_lower = maquina_sel.lower().strip()
-            resolved = False
-            
-            # 1. Intentar resolver contra las máquinas recomendadas
-            if maquinas_recomendadas:
-                for full_model in maquinas_recomendadas:
-                    if partial_lower in full_model.lower() and partial_lower != full_model.lower():
-                        debug_print(f"DEBUG: maquina_seleccionada resolved (recomendadas): '{maquina_sel}' → '{full_model}'")
-                        self.state["maquina_seleccionada"] = full_model
-                        resolved = True
-                        break
-            
-            # 2. Si no se encontró en recomendadas, buscar en todo el inventario local
-            #    para el tipo de maquinaria actual (ej: "340" → "Shindaiwa DGW340DM")
-            if not resolved:
-                from update_invertory_db.inventory_data import inventario
-                tipo = self.state.get("tipo_maquinaria")
-                for machine in inventario:
-                    if machine.get("categoria") == tipo:
-                        full_model = machine.get("modelo", "")
-                        if partial_lower in full_model.lower() and partial_lower != full_model.lower():
-                            debug_print(f"DEBUG: maquina_seleccionada resolved (inventario): '{maquina_sel}' → '{full_model}'")
-                            self.state["maquina_seleccionada"] = full_model
-                            break
-        
-    def _get_last_bot_question(self) -> Tuple[Optional[str], Optional[str]]:
-        """Obtiene la última pregunta que hizo el bot para proporcionar contexto"""
-        try:
-            # Buscar el último mensaje del bot en el historial
-            for msg in reversed(self.state["messages"]):
-                if msg["role"] == "assistant" or msg["sender"] == "bot":
-                    content = msg["content"]
-                    question_type = msg["question_type"]
-                    # Si el mensaje contiene una pregunta, extraerla
-                    if "?" in content:
-                        # Buscar la última línea que contenga una pregunta
-                        lines = content.split('\n')
-                        for line in reversed(lines):
-                            if "?" in line and line.strip():
-                                return line.strip(), question_type
-                        # Si no se encuentra una línea específica, devolver todo el contenido
-                        return content, question_type
-                    return content, question_type
-            return None, None
-        except Exception as e:
-            logging.error(f"Error obteniendo última pregunta del bot: {e}")
-            return None, None
-    
-    def get_status_message(self) -> str:
-        """
-        Construye un resumen LEGIBLE y agrupado del estado de la conversación
-        (comando 'status'). Usado tanto en WhatsApp como en las pruebas manuales.
-        """
-        s = self.state
-
-        def val(key, default="—"):
-            v = s.get(key)
-            if v is None or v == "" or v == []:
-                return default
-            return v
-
-        def yesno(key):
-            return "Sí" if s.get(key) else "No"
-
-        # quiere_cotizacion es tri-estado: None (sin preguntar) / True / False
-        qc = s.get("quiere_cotizacion")
-        qc_str = "—" if qc is None else ("Sí" if qc else "No")
-
-        detalles = s.get("detalles_maquinaria") or {}
-        detalles_str = ", ".join(f"{k}={v}" for k, v in detalles.items()) if detalles else "—"
-
-        recomendadas = s.get("maquinas_recomendadas") or []
-        recomendadas_str = ", ".join(recomendadas) if recomendadas else "—"
-
-        return f"""📊 ESTADO DE LA CONVERSACIÓN
-━━━━━━━━━━━━━━━━━━━━━━━━━
-👤 Usuario: {self.current_user_id or '—'}
-🔄 Modo: {val('conversation_mode')}  |  ✅ Completada: {yesno('completed')}  |  📨 Cotización enviada: {yesno('cotizacion_enviada')}
-
-👤 LEAD
-   • Nombre: {val('nombre')}
-   • Apellido: {val('apellido')}
-   • Correo: {val('correo')}
-   • Teléfono: {val('telefono')}
-   • Estado (ubicación): {val('lugar_requerimiento')}
-
-🏢 EMPRESA
-   • Tipo de cliente: {val('tipo_cliente')}
-   • Nombre empresa: {val('nombre_empresa')}
-   • Giro: {val('giro_empresa')}
-   • Constancia fiscal: {val('constancia_fiscal_entregada')}
-
-🔧 MAQUINARIA / COTIZACIÓN
-   • Tipo de ayuda: {val('tipo_ayuda')}
-   • Tipo de maquinaria: {val('tipo_maquinaria')}
-   • Detalles: {detalles_str}
-   • Quiere cotización: {qc_str}
-   • Recomendadas: {recomendadas_str}
-   • Seleccionada: {val('maquina_seleccionada')}
-
-💬 Mensajes: {len(s.get('messages', []))}"""
-
-    def get_lead_data_json(self) -> str:
-        """Obtiene los datos del lead en formato JSON"""
-        return json.dumps(get_current_state_str(self.state), indent=2, ensure_ascii=False)
-    
-    def process_last_lead_message(self, wa_id: str) -> Optional[str]:
-        """
-        Procesa el último mensaje del lead y genera una respuesta contextual.
-        Esta función es específica para el endpoint /start-bot-mode.
-        """
-        try:
-            debug_print(f"DEBUG: Procesando último mensaje del lead para {wa_id}")
-
-            self.load_conversation(wa_id)
-                        
-            # Verificar que hay mensajes en la conversación
-            messages = self.state.get("messages", [])
-            if not messages:
-                debug_print(f"DEBUG: No hay mensajes en la conversación para {wa_id}")
-                return None
-            
-            # Obtener el último mensaje
-            last_message = messages[-1]
-            
-            # Verificar que el último mensaje sea del lead
-            if last_message.get("sender") != "lead" and last_message.get("role") != "user":
-                debug_print(f"DEBUG: El último mensaje no es del lead para {wa_id}")
-                return None
-            
-            # Obtener el contenido del mensaje
-            message_content = last_message.get("content", "")
-            if not message_content or not message_content.strip():
-                debug_print(f"DEBUG: El último mensaje del lead está vacío para {wa_id}")
-                return None
-            
-            debug_print(f"DEBUG: Procesando mensaje del lead: '{message_content}'")
-
-            # Detectar la referencia a máquina también en este camino. Es
-            # OBLIGATORIO fijar self._machine_ref en cada turno: la instancia del
-            # chatbot se reutiliza entre requests y un valor viejo haría que el
-            # bot reconociera una máquina que el lead nunca mencionó.
-            extracted_info: Dict[str, Any] = {}
-            self._machine_ref = self._detect_and_merge_machine_reference(message_content, extracted_info)
-            self._detect_and_store_brands(message_content)
-            if extracted_info:
-                self._update_state_with_extracted_info(extracted_info)
-
-            return self._process_and_respond(message_content, extracted_info)
-            
-        except Exception as e:
-            logging.error(f"Error procesando último mensaje del lead: {e}")
-            return "Disculpe, hubo un error técnico. ¿Podría intentar de nuevo?"
+)

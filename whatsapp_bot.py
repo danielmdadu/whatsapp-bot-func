@@ -360,12 +360,21 @@ class WhatsAppBot:
             
             # Generar texto descriptivo para el modelo
             msg_type = multimedia.get('type', 'documento')
+            # El caption es lo que el lead ESCRIBIÓ junto al archivo y suele traer
+            # el dato clave ("el martillo que piden es un Atlas Copco TEX12PE").
+            # Antes se descartaba y el bot respondía como si no hubiera leído nada.
+            caption = (multimedia.get('caption') or "").strip()
+
             if msg_type == "document":
                 # Usar esta frase específica para ayudar a que la extracción comprenda que llegó la constancia
                 simulated_text = "Aquí está el archivo PDF adjunto."
+                if caption:
+                    simulated_text += f" {caption}"
+            elif caption:
+                simulated_text = caption
             else:
                 simulated_text = f"[Archivo {msg_type} adjunto recibido]"
-                
+
             # Procesar el mensaje con LangChain para generar la respuesta correspondiente
             self.chatbot.send_message(simulated_text, whatsapp_message_id, hubspot_manager=None)
             

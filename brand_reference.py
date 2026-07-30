@@ -63,6 +63,7 @@ class BrandAvailability:
     tipo_solicitado: Optional[str]        # type_id que pidió el lead, si se conoce
     tipo_solicitado_display: Optional[str]  # Nombre amigable del tipo solicitado
     marcas_del_tipo: List[str]    # Marcas que sí manejamos en el tipo solicitado
+    es_correccion: bool = False   # `marca` salió de corregir un typo de `texto`
 
 
 # ============================================================================
@@ -368,6 +369,51 @@ def _extract_brands_after_marca(message: str) -> List[str]:
 # API PÚBLICA
 # ============================================================================
 
+def _edit_distance_le_1(a: str, b: str) -> bool:
+    """True si `a` y `b` difieren en una sola edición (sustituir, insertar, borrar)."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if a == b:
+        return True
+
+    # Iguala longitudes recorriendo ambas y permitiendo un único desajuste.
+    corta, larga = (a, b) if len(a) <= len(b) else (b, a)
+    i = j = 0
+    usada = False
+    while i < len(corta) and j < len(larga):
+        if corta[i] == larga[j]:
+            i += 1
+            j += 1
+            continue
+        if usada:
+            return False
+        usada = True
+        if len(corta) == len(larga):
+            i += 1  # sustitución
+        j += 1      # inserción/borrado
+    return True
+
+
+def _fuzzy_own_brand(key: str) -> Optional[str]:
+    """
+    Resuelve un typo de UNA de nuestras marcas: "Roku" → "Toku".
+
+    Caso real (5.json): el lead pidió un "martillo neumático marca Roku" y el
+    bot le contestó que no la manejamos. Toku es justamente nuestra única marca
+    de rompedores.
+
+    Solo se corrige hacia marcas NUESTRAS y solo si el texto no es ya una marca
+    conocida: inventarle al lead que su marca es "casi" la nuestra sería peor
+    que no reconocerla. Se exigen 4+ caracteres para que "CAT"/"JCB" no colisionen.
+    """
+    if len(key) < 4 or key in _KNOWN_BRANDS:
+        return None
+
+    candidatos = [own for own in _OWN_BRANDS if _edit_distance_le_1(key, own)]
+    # Solo si es inequívoco: dos candidatos significan que estamos adivinando.
+    return candidatos[0] if len(candidatos) == 1 else None
+
+
 def _has_brand_context(message: str) -> bool:
     """True si el mensaje habla de maquinaria (y no, por ejemplo, de un apellido)."""
     tokens = set(re.findall(r"[a-z0-9ñ]+", _normalize(message)))
@@ -415,15 +461,26 @@ def detect_brand_mentions(message: Optional[str]) -> List[str]:
 
     # Dedup preservando el orden de aparición.
     seen: Set[str] = set()
-    unique: List[str] = []
+    unique: List[Tuple[str, str]] = []  # (texto del lead, clave canónica)
     for hit in hits:
         canonical = _KNOWN_BRANDS.get(_normalize(hit), hit)
         key = _normalize(canonical)
         if key in seen:
             continue
         seen.add(key)
-        unique.append(hit)
-    return unique
+        unique.append((hit, key))
+
+    # Las marcas de dos palabras se detectan enteras por el patrón Y sueltas por
+    # el camino de "marca X": "marca Atlas Copco" daba Atlas Copco, Atlas y
+    # Copco, tres marcas donde solo hay una. Se descarta la parte cuando ya
+    # está el todo.
+    def _es_parte_de_otra(key: str) -> bool:
+        return any(
+            otra != key and re.search(rf"(?<![\w]){re.escape(key)}(?![\w])", otra)
+            for _, otra in unique
+        )
+
+    return [texto for texto, key in unique if not _es_parte_de_otra(key)]
 
 
 def canonical_brand(text: str) -> str:
@@ -456,8 +513,18 @@ def evaluate_brand_names(
     for texto in mentions:
         key = _normalize(texto)
         canonical = _KNOWN_BRANDS.get(key, texto.strip())
-
         own_categories = _OWN_BRAND_CATEGORIES.get(key, set())
+
+        # Typo de una marca nuestra ("Roku" → "Toku"): se resuelve a la nuestra
+        # y se marca, para que el bot lo confirme en vez de darlo por hecho.
+        es_correccion = False
+        if not own_categories:
+            fuzzy = _fuzzy_own_brand(key)
+            if fuzzy:
+                canonical = _OWN_BRANDS[fuzzy]
+                own_categories = _OWN_BRAND_CATEGORIES.get(fuzzy, set())
+                es_correccion = True
+
         tipos_de_la_marca = sorted(
             machinery_config_service.get_type_display_name(cat) for cat in own_categories
         )
@@ -480,6 +547,7 @@ def evaluate_brand_names(
             tipo_solicitado=machine_type,
             tipo_solicitado_display=tipo_display,
             marcas_del_tipo=marcas_del_tipo,
+            es_correccion=es_correccion,
         ))
 
     return evaluations
@@ -513,7 +581,19 @@ def build_brand_facts(evaluations: List[BrandAvailability]) -> str:
 
     lines: List[str] = []
     for ev in evaluations:
-        if ev.estatus == NO_DISPONIBLE:
+        if ev.es_correccion:
+            alcance = (
+                f"en {ev.tipo_solicitado_display}"
+                if ev.estatus == DISPONIBLE_EN_TIPO and ev.tipo_solicitado_display
+                else f"en {_join_es(ev.tipos_de_la_marca)}"
+            )
+            lines.append(
+                f'- El lead escribió "{ev.texto}", que no existe como marca. Casi seguro '
+                f"quiso decir {ev.marca}, que es NUESTRA marca y sí manejamos {alcance}. "
+                f"Pregúntale con naturalidad si se refiere a {ev.marca} en vez de darlo "
+                f'por hecho, y NUNCA afirmes que manejamos la marca "{ev.texto}".'
+            )
+        elif ev.estatus == NO_DISPONIBLE:
             lines.append(
                 f"- {ev.marca}: NO la manejamos. No tenemos ningún equipo de esa "
                 f"marca en el inventario, en ningún tipo de maquinaria."
@@ -559,13 +639,26 @@ def build_brand_disclaimer(evaluations: List[BrandAvailability]) -> str:
     if not evaluations:
         return ""
 
-    no_disponibles = [ev.marca for ev in evaluations if ev.estatus == NO_DISPONIBLE]
-    otros_tipos = [ev for ev in evaluations if ev.estatus == DISPONIBLE_EN_OTROS_TIPOS]
-    if not no_disponibles and not otros_tipos:
+    correcciones = [ev for ev in evaluations if ev.es_correccion]
+    no_disponibles = [
+        ev.marca for ev in evaluations
+        if ev.estatus == NO_DISPONIBLE and not ev.es_correccion
+    ]
+    otros_tipos = [
+        ev for ev in evaluations
+        if ev.estatus == DISPONIBLE_EN_OTROS_TIPOS and not ev.es_correccion
+    ]
+    if not no_disponibles and not otros_tipos and not correcciones:
         return ""
 
     ev = evaluations[0]
     partes: List[str] = []
+
+    for correccion in correcciones:
+        partes.append(
+            f"Por \"{correccion.texto}\" entiendo que te refieres a {correccion.marca}, "
+            f"que sí manejamos en {_join_es(correccion.tipos_de_la_marca)}."
+        )
 
     if no_disponibles:
         marca_str = _join_es(no_disponibles, "ni")
@@ -582,7 +675,9 @@ def build_brand_disclaimer(evaluations: List[BrandAvailability]) -> str:
             f"{otro.tipo_solicitado_display}."
         )
 
-    if ev.tipo_solicitado_display and ev.marcas_del_tipo:
+    # La alternativa solo hace falta si le negamos algo. Si únicamente se corrigió
+    # un typo, la corrección ya dijo qué manejamos y repetirlo suena a robot.
+    if (no_disponibles or otros_tipos) and ev.tipo_solicitado_display and ev.marcas_del_tipo:
         partes.append(
             f"En {ev.tipo_solicitado_display} trabajamos con "
             f"{_join_es(ev.marcas_del_tipo)}."

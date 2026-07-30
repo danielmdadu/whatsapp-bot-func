@@ -18,6 +18,14 @@ from datetime import datetime, timezone
 import logging
 from hubspot_manager import HubSpotManager
 from inventory_service import InventoryService
+from company_profile import (
+    CoverageStatus,
+    build_company_facts,
+    build_coverage_disclaimer,
+    build_coverage_instruction,
+    evaluate_coverage,
+    mentions_coverage,
+)
 from brand_reference import (
     DISPONIBLE_EN_TIPO,
     BrandAvailability,
@@ -734,7 +742,8 @@ class IntelligentResponseGenerator:
         next_question: str = None,
         is_inventory_question: bool = False,
         question_type: str = None,
-        machine_reference: Optional[MachineReference] = None
+        machine_reference: Optional[MachineReference] = None,
+        coverage: Optional[CoverageStatus] = None
     ) -> str:
         """Genera una respuesta contextual apropiada usando un enfoque conversacional"""
         
@@ -798,6 +807,14 @@ class IntelligentResponseGenerator:
             # esto el LLM improvisa y se contradice entre un mensaje y otro.
             brand_evaluations = self._pending_brand_evaluations(current_state)
 
+            # Aclaración de cobertura para un lead de fuera de México. Se le
+            # sigue calificando igual; solo se le dice una vez el alcance real.
+            coverage_pendiente = bool(
+                coverage
+                and coverage.fuera_de_mexico
+                and not current_state.get("cobertura_aclarada")
+            )
+
             if is_inventory_question:
                 inventory_instruction = (
                     "El mensaje del usuario incluye una pregunta sobre inventario. "
@@ -828,11 +845,19 @@ class IntelligentResponseGenerator:
                         machine_type, detalles, brands=marcas_solicitadas_disponibles or None
                     )
 
-                # Aclaración de marcas para este camino, que arma el texto sin LLM.
+                # Aclaraciones para este camino, que arma el texto sin LLM.
                 brand_disclaimer = build_brand_disclaimer(brand_evaluations)
                 if brand_evaluations:
                     current_state["marcas_aclaradas"] = True
-                prefijo_marcas = f"{brand_disclaimer}\n\n" if brand_disclaimer else ""
+
+                coverage_disclaimer = build_coverage_disclaimer(coverage) if coverage_pendiente else ""
+                if coverage_disclaimer:
+                    current_state["cobertura_aclarada"] = True
+
+                prefijo_aclaraciones = "\n\n".join(
+                    p for p in (coverage_disclaimer, brand_disclaimer) if p
+                )
+                prefijo_aclaraciones = f"{prefijo_aclaraciones}\n\n" if prefijo_aclaraciones else ""
 
                 if recommended_machines:
                     # Formatear lista de máquinas recomendadas
@@ -870,27 +895,27 @@ class IntelligentResponseGenerator:
                     intro_recomendacion = "la siguiente opción disponible" if len(recommended_models) == 1 else "las siguientes opciones disponibles"
                     # Tras la aclaración de marcas, un "Muy bien" suena a que se
                     # celebró la mala noticia; se enlaza directo.
-                    apertura = "Basándome" if prefijo_marcas else "Muy bien, basándome"
+                    apertura = "Basándome" if prefijo_aclaraciones else "Muy bien, basándome"
 
                     if current_state.get("quiere_cotizacion") is True:
                         cierre_cotizacion = "Para la cotización que solicitaste, ¿te interesa esta opción?" if len(recommended_models) == 1 else "Para la cotización que solicitaste, ¿te interesa alguna de estas opciones?"
-                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
+                        return f"""{prefijo_aclaraciones}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
 {machines_list}
 
 {cierre_cotizacion}"""
                     else:
                         cierre_cotizacion = "¿Te gustaría recibir una cotización formal por esta?" if len(recommended_models) == 1 else "¿Te gustaría recibir una cotización formal por alguna de estas?"
-                        return f"""{prefijo_marcas}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
+                        return f"""{prefijo_aclaraciones}{apertura} en tus requerimientos, te recomiendo {intro_recomendacion} en nuestro inventario:
 {machines_list}
 {cierre_cotizacion}"""
                 else:
                      # Fallback si no hay coincidencias exactas
                     # Con aclaración de marcas previa, el "Entendido." sobra.
-                    entendido = "" if prefijo_marcas else "Entendido. "
+                    entendido = "" if prefijo_aclaraciones else "Entendido. "
                     if current_state.get("quiere_cotizacion") is True:
-                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
+                        return f"""{prefijo_aclaraciones}{entendido}No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
                     else:
-                        return f"""{prefijo_marcas}{entendido}No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
+                        return f"""{prefijo_aclaraciones}{entendido}No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
 
 ¿Te gustaría que un asesor te contacte para ofrecerte una solución personalizada?"""
                 # END MODIFICATION
@@ -972,6 +997,16 @@ class IntelligentResponseGenerator:
                 machine_reference, next_question, question_type
             )
 
+            # La identidad de la empresa va SIEMPRE: es barata y corta de raíz
+            # que el bot invente ubicaciones, sucursales o países.
+            company_instruction = build_company_facts()
+
+            # OJO: aquí NO se marca cobertura_aclarada. Solo se marca si la
+            # respuesta generada realmente menciona México (ver más abajo): en el
+            # primer turno el LLM está presentándose y suele ignorar esta
+            # instrucción, y darla por dicha dejaría al lead sin enterarse nunca.
+            coverage_instruction = build_coverage_instruction(coverage) if coverage_pendiente else ""
+
             brand_instruction = self._build_brand_instruction(brand_evaluations)
             if brand_instruction:
                 # Ya se le entregó al LLM la verdad sobre las marcas pedidas: no
@@ -992,6 +1027,8 @@ class IntelligentResponseGenerator:
                 tipo_ayuda_instruction=tipo_ayuda_instruction,
                 machine_reference_instruction=machine_reference_instruction,
                 brand_instruction=brand_instruction,
+                company_instruction=company_instruction,
+                coverage_instruction=coverage_instruction,
                 tipos_maquinaria_validos=tipos_maquinaria_validos
             )
 
@@ -1001,6 +1038,10 @@ class IntelligentResponseGenerator:
             
             result = response.content.strip()
             debug_print(f"DEBUG: Respuesta conversacional generada: '{result}'")
+
+            # La aclaración de cobertura se da por hecha solo si el bot la dijo.
+            if coverage_instruction and mentions_coverage(result):
+                current_state["cobertura_aclarada"] = True
             
             # Ya no agreamos la lista de campos pendientes hardcoded,
             # porque el LLM ya incorpora la pregunta dentro del propio texto.
@@ -1254,6 +1295,7 @@ class IntelligentLeadQualificationChatbot:
 
         # Referencia a máquina detectada en el mensaje del turno actual (si hubo)
         self._machine_ref: Optional[MachineReference] = None
+        self._coverage: Optional[CoverageStatus] = None
 
     def _create_empty_state(self) -> ConversationState:
         """Crea un estado vacío"""
@@ -1269,7 +1311,8 @@ class IntelligentLeadQualificationChatbot:
             "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
             "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
             "marcas_solicitadas": [],  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
-            "marcas_aclaradas": False  # True cuando el bot ya le respondió sobre esas marcas
+            "marcas_aclaradas": False,  # True cuando el bot ya le respondió sobre esas marcas
+            "cobertura_aclarada": False  # True cuando ya se le dijo que solo operamos en México
         }
         
         # Agregamos los campos que se preguntan al usuario desde el FIELDS_CONFIG_PRIORITY
@@ -1291,6 +1334,16 @@ class IntelligentLeadQualificationChatbot:
         
         if stored_state:
             self.state = stored_state
+            # Reparar conversaciones que quedaron con detalles_maquinaria como
+            # string ("No especificado"). Sin esto, un lead cuyo estado ya se
+            # corrompió en producción recibe "hubo un error técnico" en CADA
+            # mensaje y no hay forma de que salga de ahí.
+            if not isinstance(self.state.get("detalles_maquinaria"), dict):
+                logging.warning(
+                    f"detalles_maquinaria corrupto para {user_id} "
+                    f"({self.state.get('detalles_maquinaria')!r}); se reinicia a {{}}."
+                )
+                self.state["detalles_maquinaria"] = {}
             debug_print(f"DEBUG: Estado cargado para usuario {user_id}")
         else:
             logging.info(f"No hay estado existente para usuario {user_id}, creando nuevo estado")
@@ -1368,6 +1421,10 @@ class IntelligentLeadQualificationChatbot:
             # Actualizar el estado con la información extraída
             self._update_state_with_extracted_info(extracted_info)
 
+            # Después de actualizar el estado: el lugar del requerimiento puede
+            # acabar de llegar y es parte del veredicto de cobertura.
+            self._coverage = self._evaluate_lead_coverage()
+
             # Verificar modo de conversación antes de generar respuesta
             current_mode = self.state.get("conversation_mode", "bot")
             
@@ -1427,6 +1484,25 @@ class IntelligentLeadQualificationChatbot:
             )
 
         return ref
+
+    def _evaluate_lead_coverage(self) -> CoverageStatus:
+        """
+        Ubica al lead respecto a la zona de operación de Alpha C, con la lada de
+        su WhatsApp y el lugar donde pide el equipo.
+
+        Se recalcula cada turno porque `lugar_requerimiento` puede llegar tarde
+        y cambiar el veredicto: un número de Venezuela que pide la máquina para
+        Nuevo León sí está en cobertura.
+        """
+        coverage = evaluate_coverage(
+            self.current_user_id, self.state.get("lugar_requerimiento")
+        )
+        if coverage.fuera_de_mexico:
+            debug_print(
+                f"DEBUG: Lead fuera de cobertura ({coverage.pais}, "
+                f"detectado por {coverage.motivo})."
+            )
+        return coverage
 
     def _detect_and_store_brands(self, user_message: str) -> None:
         """
@@ -1488,7 +1564,8 @@ class IntelligentLeadQualificationChatbot:
                 self.state,
                 next_question=None,
                 is_inventory_question=False,
-                question_type="conversation_complete"
+                question_type="conversation_complete",
+                coverage=self._coverage
             )
             return self._add_message_and_return_response(generated_response, "")
 
@@ -1575,7 +1652,8 @@ class IntelligentLeadQualificationChatbot:
             next_question=next_question_str,
             is_inventory_question=is_inventory_question,
             question_type=next_question_type,
-            machine_reference=self._machine_ref
+            machine_reference=self._machine_ref,
+            coverage=self._coverage
         )
 
         return self._add_message_and_return_response(generated_response, storage_question_type)
@@ -1913,6 +1991,20 @@ class IntelligentLeadQualificationChatbot:
                 continue
 
             # 3. Manejo de casos especiales
+            if key == "detalles_maquinaria" and not isinstance(value, dict):
+                # detalles_maquinaria SIEMPRE es un dict. Cuando el lead dice "no
+                # tengo esa información" sobre un detalle de la máquina,
+                # detect_negative_response devuelve field="detalles_maquinaria" y
+                # value="No especificado" (un string). Escribirlo dejaba el estado
+                # corrupto y TODAS las llamadas posteriores a detalles.get()
+                # reventaban: la conversación quedaba muerta con "hubo un error
+                # técnico" en cada mensaje (visto en 5.json al replicarla).
+                debug_print(
+                    f"DEBUG: Ignorando detalles_maquinaria no-dict ({value!r}); "
+                    "el estado conserva los detalles ya extraídos."
+                )
+                continue
+
             if key == "detalles_maquinaria" and isinstance(value, dict):
                 # Normalizar a los campos canónicos del tipo actual: remapear alias
                 # conocidos (ej. altura_plataforma_m -> altura_trabajo_m) y descartar
@@ -2192,6 +2284,7 @@ class IntelligentLeadQualificationChatbot:
             self._detect_and_store_brands(message_content)
             if extracted_info:
                 self._update_state_with_extracted_info(extracted_info)
+            self._coverage = self._evaluate_lead_coverage()
 
             return self._process_and_respond(message_content, extracted_info)
             
