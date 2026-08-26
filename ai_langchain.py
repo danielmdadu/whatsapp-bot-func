@@ -259,6 +259,84 @@ def get_pending_empresa_fields(current_state: ConversationState) -> List[str]:
             
         return pending_basic
 
+
+# Cómo se le pide al lead cada campo pendiente cuando es el ÚNICO que falta.
+# Las llaves son los labels que devuelve get_pending_empresa_fields().
+_EMPRESA_FIELD_SINGLE_QUESTION = {
+    "si te dedicas a la venta/renta de maquinaria":
+        "Para continuar con la cotización, ¿te dedicas a la venta o renta de maquinaria?",
+    "correo electrónico":
+        "Para continuar con la cotización, ¿me podrías compartir tu correo electrónico?",
+    "ubicación (estado de la República Mexicana)":
+        "Para continuar con la cotización, ¿en qué estado de la República Mexicana requieres el equipo?",
+    "Constancia de Situación Fiscal":
+        "Para poder brindarle un precio preferencial como distribuidor, le pido de favor "
+        "que me comparta por este medio su Constancia de Situación Fiscal.",
+    "Giro de la empresa":
+        "Para continuar, ¿me podrías indicar cuál es el giro de tu empresa?",
+    "Nombre de la empresa":
+        "Para generar la cotización, ¿me podrías indicar el nombre de tu empresa?",
+}
+
+# Cómo se enumera cada campo cuando falta más de uno.
+_EMPRESA_FIELD_LIST_ITEM = {
+    "si te dedicas a la venta/renta de maquinaria": "¿Te dedicas a la venta o renta de maquinaria?",
+    "correo electrónico": "Correo electrónico",
+    "ubicación (estado de la República Mexicana)": "Estado de la República Mexicana",
+}
+
+# Palabras que delatan que la respuesta generada SÍ nombró el campo pendiente.
+# Se usan como red de seguridad, no para validar la redacción exacta.
+_EMPRESA_FIELD_KEYWORDS = {
+    "si te dedicas a la venta/renta de maquinaria": ("venta", "renta", "distribuidor"),
+    "correo electrónico": ("correo", "email", "e-mail"),
+    "ubicación (estado de la República Mexicana)": ("estado", "ubicaci"),
+    "Constancia de Situación Fiscal": ("constancia", "csf", "situación fiscal", "situacion fiscal"),
+    "Giro de la empresa": ("giro",),
+    "Nombre de la empresa": ("nombre de", "razón social", "razon social"),
+}
+
+
+def build_datos_empresa_question(pending_fields: List[str]) -> str:
+    """
+    Texto autocontenido para pedir los datos de empresa que faltan.
+
+    SIEMPRE nombra los campos pendientes. Este texto viaja al LLM como
+    "SIGUIENTE PREGUNTA A HACER" y además se usa como fallback, y el LLM lo
+    repite literal con frecuencia; cuando era genérico ("Necesito los
+    siguientes datos de su empresa para continuar con la cotización.") el lead
+    recibía la petición sin saber qué datos faltaban y reenviaba los mismos
+    una y otra vez (ver real_conversations_withLeads/6.json).
+    """
+    if not pending_fields:
+        return ""
+
+    if len(pending_fields) == 1:
+        field = pending_fields[0]
+        return _EMPRESA_FIELD_SINGLE_QUESTION.get(
+            field, f"Para continuar con la cotización necesito un dato más: {field}"
+        )
+
+    items = [_EMPRESA_FIELD_LIST_ITEM.get(f, f) for f in pending_fields]
+    numbered = "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1))
+    return f"Para avanzar con la cotización necesito algunos datos de tu empresa.\n{numbered}"
+
+
+def response_omite_campos_pendientes(response: str, pending_fields: List[str]) -> bool:
+    """
+    True si la respuesta generada no nombra NI UNO de los campos pendientes.
+    En ese caso el lead no tiene forma de saber qué se le está pidiendo.
+    """
+    if not pending_fields or not response:
+        return bool(pending_fields)
+
+    lowered = response.lower()
+    for field in pending_fields:
+        for keyword in _EMPRESA_FIELD_KEYWORDS.get(field, (field.lower(),)):
+            if keyword in lowered:
+                return False
+    return True
+
 # ============================================================================
 # SISTEMA DE SLOT-FILLING INTELIGENTE
 # ============================================================================
@@ -554,7 +632,10 @@ class IntelligentSlotFiller:
             pending_fields = get_pending_empresa_fields(current_state)
             if len(pending_fields) > 0:
                 return {
-                    "question": "Necesito los siguientes datos de su empresa para continuar con la cotización.",  # Mensaje explícito para evitar que el LLM piense que acabó
+                    # El texto enumera los campos que faltan: el LLM lo repite
+                    # literal muy seguido y también es el fallback si falla la
+                    # generación, así que nunca debe ser genérico.
+                    "question": build_datos_empresa_question(pending_fields),
                     "reason": "Para generar la cotización",
                     "question_type": "datos_empresa"
                 }
@@ -933,65 +1014,38 @@ class IntelligentResponseGenerator:
                 if not pending_fields:
                     return ""
                 
-                # Agregar instrucción específica para datos_empresa
-                datos_empresa_instruction = """
-                
+                # La petición sale de build_datos_empresa_question() para que la
+                # instrucción, el next_question y el fallback digan exactamente
+                # lo mismo y siempre nombren los campos que faltan.
+                peticion_explicita = build_datos_empresa_question(pending_fields)
+                datos_empresa_instruction = f"""
+
                 INSTRUCCIÓN ESPECIAL PARA RECOPILAR DATOS:
                 PASO 1 (OBLIGATORIO): Si el usuario hace una pregunta o comentario, PRIMERO respóndele de forma breve y natural. Por ejemplo, si pregunta sobre estados de entrega, ubicaciones, características, etc., responde a su duda con la información que tengas. EXCEPCIÓN: si pregunta por el precio o costo, NO se lo digas ni inventes una cifra; explícale de forma amable que el precio se incluye en la cotización formal y que para generarla necesitas los datos que le estás solicitando.
                 PASO 2: Después de responder, haz una transición natural para pedir los datos pendientes. La transición NO debe empezar con una expresión de confirmación ("Claro", "Perfecto", "Por supuesto", etc.); enlaza directamente con la petición.
-                - Usa un mensaje como: """
-                should_list_pending_fields = False
-                uso = current_state.get("tipo_cliente")
-                
-                if not uso and "si te dedicas a la venta/renta de maquinaria" in pending_fields:
-                    # Construir lista enumerada de campos pendientes
-                    numbered_items = []
-                    numbered_items.append("¿Te dedicas a la venta o renta de maquinaria?")
-                    if "correo electrónico" in pending_fields:
-                        numbered_items.append("Correo electrónico")
-                    if "ubicación (estado de la República Mexicana)" in pending_fields:
-                        numbered_items.append("Estado de la República Mexicana")
-                    numbered_list = "\n".join([f"{i+1}. {item}" for i, item in enumerate(numbered_items)])
-                    datos_empresa_instruction += f"""Para avanzar con la cotización necesito algunos datos de tu empresa.
-{numbered_list}"""
-                
-                elif "Constancia de Situación Fiscal" in pending_fields and len(pending_fields) == 1:
-                    datos_empresa_instruction += "Pide ÚNICAMENTE la Constancia de Situación Fiscal. EXPRESAMENTE PROHIBIDO pedir otro dato como nombre de empresa, teléfono o correo. Usa este mensaje exacto: 'Perfecto, para poder brindarle un precio preferencial como distribuidor, le pido de favor que me comparta por este medio su Constancia de Situación Fiscal.'"
-                
-                elif pending_fields == ["Giro de la empresa"]:
-                    datos_empresa_instruction += "Pregunta ÚNICAMENTE por el giro de la empresa usando un mensaje como: 'Para continuar, ¿me podrías indicar cuál es el giro de tu empresa?' No uses viñetas."
-                    should_list_pending_fields = False
-                    
-                elif pending_fields == ["Nombre de la empresa"]:
-                    datos_empresa_instruction += "Pregunta ÚNICAMENTE por el nombre de la empresa usando un mensaje como: 'Para generar la cotización, ¿me podrías indicar el nombre de tu empresa?' No uses viñetas."
-                    should_list_pending_fields = False
-
-                else:
-                    dato_str = "estos datos" if len(pending_fields) > 1 else "este dato"
-                    datos_empresa_instruction += f"También necesito {dato_str}:"
-                    should_list_pending_fields = True
-                
-                if should_list_pending_fields:
-                    pending_fields_numbered = "\n".join([f"{i+1}. {f}" for i, f in enumerate(pending_fields)])
-                    datos_empresa_instruction += f"""
-                - Menciona EXPLÍCITAMENTE los campos que faltan en una LISTA ENUMERADA (1. 2. 3.) y pídelos en este mismo mensaje, en este orden:
-{pending_fields_numbered}
-                - NUNCA uses viñetas (•) ni guiones (-). SIEMPRE usa números (1. 2. 3.).
-                - Si el usuario ya contestó alguno de estos campos en su último mensaje, NO lo repitas ni lo vuelvas a pedir.
-                - NUNCA inventes campos adicionales (por ejemplo: teléfono) si no están en la lista.
-                - IMPORTANTE: NO te despidas, NO cierres la conversación.
-                    """
-                else:
-                    datos_empresa_instruction += """
-                - NUNCA menciones los campos pendientes en tu respuesta, solo responde con la introducción
-                - NUNCA menciones información que se extrajo previamente, ni confirmes la información recién extraída, a menos de que el usuario lo pregunte
-                - IMPORTANTE: NO te despidas, NO digas 'Perfecto, con esto terminamos', NO digas 'Gracias por la información' como cierre.
-                - Debes dejar claro que FALTAN datos y que la conversación continúa.
+                - Pide los datos con este mensaje, respetando su contenido y su formato:
+{peticion_explicita}
+                - OBLIGATORIO: nombra EXPLÍCITAMENTE cada dato que falta. PROHIBIDO pedir "los siguientes datos", "algunos datos" o "la información" sin decir cuáles son.
+                - PROHIBIDO pedir cualquier dato que no aparezca en el mensaje de arriba (por ejemplo: teléfono, nombre de la empresa o correo si no están ahí). Si el usuario ya te dio un dato, NO se lo vuelvas a pedir.
+                - Si el mensaje de arriba trae una lista enumerada, consérvala tal cual. NUNCA uses viñetas (•) ni guiones (-); SIEMPRE números (1. 2. 3.).
+                - NUNCA menciones información que se extrajo previamente, ni confirmes la información recién extraída, a menos de que el usuario lo pregunte.
+                - IMPORTANTE: NO te despidas, NO digas 'Perfecto, con esto terminamos', NO digas 'Gracias por la información' como cierre. Debes dejar claro que FALTAN datos y que la conversación continúa.
                     """
 
             tipo_ayuda_instruction = ""
             if question_type == "tipo_ayuda":
                 tipo_ayuda_instruction = "IMPORTANTÍSIMO: Cuando vayas a preguntar en qué le puedes ayudar al usuario, EXCLUSIVAMENTE usa la frase: '¿En qué te puedo ayudar?' de forma literal y directa, sin agregar texto adicional a la pregunta."
+            elif question_type == "post_cierre":
+                # El lead rechazó la cotización y ya se le preguntó una vez si
+                # necesitaba algo más. Repetir esa pregunta lo dejaba en bucle.
+                tipo_ayuda_instruction = """
+                SITUACIÓN: el usuario ya rechazó la cotización y TÚ YA le preguntaste si había algo más en lo que pudieras ayudarle. NO se lo vuelvas a preguntar.
+                - PROHIBIDO repetir '¿hay algo más en lo que te pueda ayudar?' o cualquier variante.
+                - Decide SOLO con el ÚLTIMO mensaje del usuario, no con lo que hayas dicho antes: aunque ya te hayas despedido, si ahora te dice que sí necesita algo, la conversación SIGUE.
+                - Si el último mensaje es afirmativo ('sí', 'si', 'claro', 'así es') o dice que necesita algo sin decir qué, PROHIBIDO despedirte: pregúntale DIRECTAMENTE qué necesita, con '¿Qué maquinaria necesitas?'.
+                - Si el usuario menciona una máquina, un requerimiento o pide una cotización, retoma la conversación normal y pídele el dato que falte para poder ayudarle.
+                - Despídete de forma breve y cordial SOLO si el último mensaje dice que ya no necesita nada.
+                """
 
             machine_reference_instruction = self._build_machine_reference_instruction(
                 machine_reference, next_question, question_type
@@ -1045,7 +1099,18 @@ class IntelligentResponseGenerator:
             
             # Ya no agreamos la lista de campos pendientes hardcoded,
             # porque el LLM ya incorpora la pregunta dentro del propio texto.
-            
+
+            # Red de seguridad: si el LLM pidió datos sin decir cuáles, el lead
+            # se queda sin saber qué mandar y reenvía lo que ya dio (6.json).
+            # Ahí se descarta la redacción del LLM por la petición explícita.
+            if question_type == "datos_empresa" and response_omite_campos_pendientes(result, pending_fields):
+                logging.warning(
+                    "Respuesta de datos_empresa sin nombrar los campos pendientes %s; "
+                    "se sustituye por la petición explícita. Descartada: %r",
+                    pending_fields, result
+                )
+                result = build_datos_empresa_question(pending_fields)
+
             return result
             
         except Exception as e:
@@ -1303,6 +1368,7 @@ class IntelligentLeadQualificationChatbot:
             # Campos que no se preguntan al usuario
             "completed": False,
             "cotizacion_enviada": False,  # True cuando ya se envió la respuesta final (evita ciclo)
+            "cierre_ofrecido": False,  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
             "messages": [],
             "conversation_mode": "bot", # agente o bot
             "asignado_asesor": None,
@@ -1615,9 +1681,35 @@ class IntelligentLeadQualificationChatbot:
                 quiere_cot = self.state.get("quiere_cotizacion")
                 if quiere_cot is False:
                     self.state["completed"] = True
-                    final_message = "Okay, ¿hay algo más en lo que te pueda ayudar?"
-                    return self._add_message_and_return_response(final_message, "")
-                
+
+                    # El cierre se ofrece UNA sola vez. Antes se devolvía en cada
+                    # turno mientras quiere_cotizacion siguiera en False, así que
+                    # el lead recibía la misma pregunta contestara lo que
+                    # contestara ("sí", "no", "mantenimiento") y la conversación
+                    # quedaba en bucle (real_conversations_withLeads/7.json).
+                    if not self.state.get("cierre_ofrecido"):
+                        self.state["cierre_ofrecido"] = True
+                        final_message = "Okay, ¿hay algo más en lo que te pueda ayudar?"
+                        return self._add_message_and_return_response(final_message, "")
+
+                    # Ya se ofreció el cierre. Si el lead hubiera pedido otra
+                    # cotización, _update_state_with_extracted_info ya habría
+                    # reabierto el flujo y no estaríamos aquí; así que se le
+                    # responde con normalidad en vez de repetir la pregunta.
+                    generated_response = self.response_generator.generate_response(
+                        user_message,
+                        history_messages,
+                        extracted_info,
+                        self.state,
+                        next_question=None,
+                        is_inventory_question=is_inventory_question,
+                        question_type="post_cierre",
+                        machine_reference=self._machine_ref,
+                        coverage=self._coverage
+                    )
+                    return self._add_message_and_return_response(generated_response, "")
+
+
                 self.state["completed"] = True
                 # Se usan los valores por defecto
             else:
@@ -1897,16 +1989,21 @@ class IntelligentLeadQualificationChatbot:
         """
         debug_print(f"DEBUG: Actualizando estado con información: {extracted_info}")
 
-        # Pre-check: si la conversación ya estaba completada y llega nueva info de maquinaria,
+        # Pre-check: si el flujo ya estaba cerrado y llega nueva info de maquinaria,
         # reiniciar el flujo de cotización (mantiene datos de empresa).
-        # Esto permite: "también cotízame un generador de 35 kw" tras completar otra cotización.
-        if self.state.get("completed"):
+        # Esto permite: "también cotízame un generador de 35 kw" tras completar otra
+        # cotización, y también retomar después de que el lead rechazó la anterior
+        # ("no, gracias" → "¿hay algo más?" → "sí, cotízame un generador").
+        flujo_cerrado = self.state.get("completed") or self.state.get("quiere_cotizacion") is False
+        if flujo_cerrado:
             has_new_machinery_request = (
                 "tipo_maquinaria" in extracted_info
                 or ("detalles_maquinaria" in extracted_info and isinstance(extracted_info["detalles_maquinaria"], dict) and len(extracted_info["detalles_maquinaria"]) > 0)
+                # Volver a pedir cotización tras haberla rechazado también reabre.
+                or extracted_info.get("quiere_cotizacion") is True
             )
             if has_new_machinery_request:
-                debug_print("DEBUG: Conversación completada recibe nueva solicitud de maquinaria. Reiniciando flujo de cotización.")
+                debug_print("DEBUG: Flujo cerrado recibe nueva solicitud de maquinaria. Reiniciando flujo de cotización.")
                 new_tipo = extracted_info.get("tipo_maquinaria")
                 old_tipo = self.state.get("tipo_maquinaria")
                 # Si es el mismo tipo, limpiar detalles para que se llenen con los nuevos
@@ -1918,6 +2015,9 @@ class IntelligentLeadQualificationChatbot:
                 self.state["quiere_cotizacion"] = None
                 self.state["completed"] = False
                 self.state["cotizacion_enviada"] = False
+                # La conversación se reabre: el cierre vuelve a estar disponible
+                # para cuando este nuevo requerimiento termine.
+                self.state["cierre_ofrecido"] = False
 
         # Si el usuario CAMBIA un detalle de la maquinaria DESPUÉS de que ya se
         # recomendaron opciones (ej: pasa de 300A a 185A), los requerimientos

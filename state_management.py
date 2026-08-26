@@ -28,6 +28,7 @@ class ConversationState(TypedDict):
     conversation_mode: str  # "bot" | "agente"
     asignado_asesor: Optional[str]
     completed: bool
+    cierre_ofrecido: bool  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
     # ID del lead en Odoo
     odoo_lead_id: Optional[int]
     # Control del flujo de cotización
@@ -403,6 +404,9 @@ class CosmosDBStateStore(ConversationStateStore):
             "telefono": state.get("telefono"),
             "completed": state.get("completed", False),
             "cotizacion_enviada": state.get("cotizacion_enviada", False),
+            # Sin esto el flag se perdía entre mensajes y el bot volvía a
+            # preguntar "¿hay algo más...?" en cada turno (7.json).
+            "cierre_ofrecido": state.get("cierre_ofrecido", False),
             "lugar_requerimiento": state.get("lugar_requerimiento"),
             "conversation_mode": cosmos_doc.get("conversation_mode", "bot"),
             "asignado_asesor": cosmos_doc.get("asignado_asesor"),
@@ -438,6 +442,7 @@ class CosmosDBStateStore(ConversationStateStore):
             "nombre", "apellido", "tipo_ayuda", "tipo_maquinaria", "detalles_maquinaria",
             "maquina_seleccionada", "maquinas_recomendadas", "tipo_cliente", "nombre_empresa", 
             "giro_empresa", "correo", "telefono", "completed", "cotizacion_enviada",
+            "cierre_ofrecido",
             "lugar_requerimiento", "asignado_asesor", "quiere_cotizacion",
             "constancia_fiscal_entregada"
         ]
