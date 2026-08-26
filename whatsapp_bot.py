@@ -10,7 +10,7 @@ from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot
 from state_management import ConversationStateStore
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
-from hubspot_manager import HubSpotManager
+from odoo_manager import OdooManager
 from check_guardrails import ContentSafetyGuardrails
 
 # ============================================================================
@@ -301,7 +301,7 @@ class WhatsAppBot:
             # El PDF ya llegó al lead; un fallo aquí no debe romper el envío
             logging.error(f"[PDF] Error registrando el documento enviado a {wa_id}: {e}")
 
-    def process_message(self, wa_id: str, message_text: str, whatsapp_message_id: str, hubspot_manager: HubSpotManager) -> None:
+    def process_message(self, wa_id: str, message_text: str, whatsapp_message_id: str, odoo_manager: Optional[OdooManager] = None) -> None:
         """
         Procesa un mensaje entrante usando LangChain.
         El chatbot ahora envía automáticamente las respuestas por WhatsApp.
@@ -309,7 +309,7 @@ class WhatsAppBot:
         try:
             # Verificar si es un comando especial
             if message_text.lower() == "reset":
-                reset_response = self._handle_reset_command(wa_id, hubspot_manager)
+                reset_response = self._handle_reset_command(wa_id)
                 # Ignorar el Id de WhatsApp porque no se guarda en la base de datos
                 self.send_message(wa_id, reset_response)
                 return
@@ -342,7 +342,7 @@ class WhatsAppBot:
             self.state_store.add_single_message(wa_id, message_text, whatsapp_message_id, self.chatbot.state)
             
             # Procesar mensaje con LangChain (ahora envía automáticamente por WhatsApp)
-            self.chatbot.send_message(message_text, whatsapp_message_id, hubspot_manager)
+            self.chatbot.send_message(message_text, whatsapp_message_id, odoo_manager)
                 
         except Exception as e:
             logging.error(f"Error procesando mensaje: {e}")
@@ -376,14 +376,13 @@ class WhatsAppBot:
                 simulated_text = f"[Archivo {msg_type} adjunto recibido]"
 
             # Procesar el mensaje con LangChain para generar la respuesta correspondiente
-            self.chatbot.send_message(simulated_text, whatsapp_message_id, hubspot_manager=None)
+            self.chatbot.send_message(simulated_text, whatsapp_message_id)
             
         except Exception as e:
             logging.error(f"Error procesando mensaje multimedia: {e}")
 
-    def _handle_reset_command(self, wa_id: str, hubspot_manager: HubSpotManager) -> str:
-        """Maneja el comando de reset"""
-        hubspot_manager.delete_contact()
+    def _handle_reset_command(self, wa_id: str) -> str:
+        """Maneja el comando de reset (solo para pruebas, ver AGENTS.md)"""
         self.chatbot.load_conversation(wa_id)
         self.chatbot.reset_conversation()
         logging.info(f"Conversación reiniciada para usuario {wa_id}")

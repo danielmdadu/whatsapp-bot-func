@@ -21,13 +21,16 @@ COSMOS_CONNECTION_STRING
 COSMOS_DB_NAME
 COSMOS_CONTAINER_NAME
 
-# HUBSPOT
-HUBSPOT_ACCESS_TOKEN
+# ODOO CRM
+ODOO_BASE_URL
+ODOO_DATABASE
+ODOO_USERNAME
+ODOO_API_KEY
 ```
 
 ## Descripción del Proyecto
 
-Este proyecto implementa un chatbot inteligente automatizado para la calificación de leads de maquinaria ligera, integrando WhatsApp Business API con Azure OpenAI GPT-4.1-mini y LangChain. El sistema está diseñado como una Azure Function que procesa webhooks de WhatsApp y gestiona conversaciones de manera inteligente para recopilar información de clientes potenciales, consultar inventario y sincronizar datos con HubSpot.
+Este proyecto implementa un chatbot inteligente automatizado para la calificación de leads de maquinaria ligera, integrando WhatsApp Business API con Azure OpenAI GPT-4.1-mini y LangChain. El sistema está diseñado como una Azure Function que procesa webhooks de WhatsApp y gestiona conversaciones de manera inteligente para recopilar información de clientes potenciales, consultar inventario y sincronizar datos con Odoo CRM.
 
 ## Características Principales
 
@@ -57,7 +60,7 @@ Este proyecto implementa un chatbot inteligente automatizado para la calificaci�
 
 ### 💾 **Gestión de Datos y CRM**
 - **Azure Cosmos DB**: Almacenamiento persistente del estado de las conversaciones y configuración de maquinaria.
-- **HubSpot Integration**: Sincronización automática de leads y actualización de contactos en CRM.
+- **Odoo CRM Integration**: Creación y actualización automática de leads en Odoo (`crm.lead`) vía su API externa JSON-RPC, de forma best-effort (si Odoo falla, la conversación continúa sin interrupción).
 - **Estado de Conversación**: Modelo robusto que persiste el progreso del usuario entre mensajes.
 
 ## Funcionalidades del Bot

@@ -12,7 +12,7 @@ from whatsapp_bot import WhatsAppBot
 from state_management import InMemoryStateStore, CosmosDBStateStore
 from azure.cosmos import CosmosClient
 from datetime import datetime, timezone, timedelta
-from hubspot_manager import HubSpotManager
+from odoo_manager import create_odoo_manager_from_env
 
 # Silencia solo los logs detallados del SDK de Azure Cosmos y del pipeline HTTP
 logging.getLogger("azure.cosmos").setLevel(logging.ERROR)
@@ -310,19 +310,27 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
 
             logging.info(f"Mensaje duplicado no detectado: {whatsapp_message_id}")
 
-            # Crear instancia de HubSpotManager
-            hubspot_manager = HubSpotManager(os.environ["HUBSPOT_ACCESS_TOKEN"])
-
-            logging.info(f"HubSpotManager creado para usuario {wa_id}")
+            # Crear instancia de OdooManager. Es best-effort a propósito: si Odoo
+            # no está configurado, no responde, o falla la autenticación, esta
+            # función regresa None y el bot sigue la conversación sin Odoo en
+            # vez de quedarse atascado o romper el mensaje.
+            odoo_manager = create_odoo_manager_from_env()
 
             if not current_state.get("telefono"):
                 # Normalizar número de WhatsApp
                 phone_number = whatsapp_bot.normalize_mexican_number(phone_number)
                 current_state["telefono"] = phone_number
-                current_state["hubspot_contact_id"] = hubspot_manager.create_contact(wa_id, phone_number)
+
+                if odoo_manager:
+                    try:
+                        current_state["odoo_lead_id"] = odoo_manager.create_lead(wa_id, phone_number)
+                    except Exception as e:
+                        logging.error(f"Error creando lead en Odoo, se continúa sin Odoo para este mensaje: {e}")
+                        odoo_manager = None
             else:
-                hubspot_manager.contact_id = current_state["hubspot_contact_id"]
-            
+                if odoo_manager:
+                    odoo_manager.lead_id = current_state.get("odoo_lead_id")
+
             # -------------------
             # Función desactivada para desplegar en producción
             # -------------------
@@ -334,7 +342,7 @@ def process_whatsapp_message(body, whatsapp_bot: WhatsAppBot):
 
             # Ejecutar slot-filling usando el contexto del último mensaje (agente o bot)
             # Ahora el chatbot envía automáticamente las respuestas por WhatsApp
-            whatsapp_bot.process_message(wa_id, message_text, whatsapp_message_id, hubspot_manager)
+            whatsapp_bot.process_message(wa_id, message_text, whatsapp_message_id, odoo_manager)
             
         else:
             # TODO: Esto se debería registrar en Cosmos DB

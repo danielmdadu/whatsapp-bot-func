@@ -26,8 +26,41 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
-# Los 32 estados son la misma lista que ya usa HubSpot: una sola fuente de verdad.
-from hubspot_manager import ESTADOS as ESTADOS_MEXICO
+# Los 32 estados de México, usados para detectar el estado que menciona el lead.
+ESTADOS_MEXICO = [
+    "Aguascalientes",
+    "Baja California",
+    "Baja California Sur",
+    "Campeche",
+    "Chiapas",
+    "Chihuahua",
+    "Ciudad de México",
+    "Coahuila",
+    "Colima",
+    "Durango",
+    "Estado de México",
+    "Guanajuato",
+    "Guerrero",
+    "Hidalgo",
+    "Jalisco",
+    "Michoacán",
+    "Morelos",
+    "Nayarit",
+    "Nuevo León",
+    "Oaxaca",
+    "Puebla",
+    "Querétaro",
+    "Quintana Roo",
+    "San Luis Potosí",
+    "Sinaloa",
+    "Sonora",
+    "Tabasco",
+    "Tamaulipas",
+    "Tlaxcala",
+    "Veracruz",
+    "Yucatán",
+    "Zacatecas",
+]
 
 # ============================================================================
 # IDENTIDAD DE LA EMPRESA

@@ -28,8 +28,8 @@ class ConversationState(TypedDict):
     conversation_mode: str  # "bot" | "agente"
     asignado_asesor: Optional[str]
     completed: bool
-    # ID del contacto en HubSpot
-    hubspot_contact_id: Optional[str]
+    # ID del lead en Odoo
+    odoo_lead_id: Optional[int]
     # Control del flujo de cotización
     quiere_cotizacion: Optional[str]  # "sí" | "no" | None (None = aún no se ha mostrado el mensaje o no ha respondido)
 
@@ -345,7 +345,7 @@ class CosmosDBStateStore(ConversationStateStore):
         state_copy.pop("messages", None)
         state_copy.pop("conversation_mode", None)
         state_copy.pop("asignado_asesor", None)
-        state_copy.pop("hubspot_contact_id", None)
+        state_copy.pop("odoo_lead_id", None)
         
         # Tipo de maquinaria ya es string, no requiere conversión
         pass
@@ -360,7 +360,7 @@ class CosmosDBStateStore(ConversationStateStore):
             "messages": messages_formatted,
             "conversation_mode": state.get("conversation_mode", "bot"),
             "asignado_asesor": state.get("asignado_asesor"),
-            "hubspot_contact_id": state.get("hubspot_contact_id")
+            "odoo_lead_id": state.get("odoo_lead_id")
         }
         
         return cosmos_doc
@@ -406,7 +406,7 @@ class CosmosDBStateStore(ConversationStateStore):
             "lugar_requerimiento": state.get("lugar_requerimiento"),
             "conversation_mode": cosmos_doc.get("conversation_mode", "bot"),
             "asignado_asesor": cosmos_doc.get("asignado_asesor"),
-            "hubspot_contact_id": cosmos_doc.get("hubspot_contact_id"),
+            "odoo_lead_id": cosmos_doc.get("odoo_lead_id"),
             "quiere_cotizacion": state.get("quiere_cotizacion"),
             "constancia_fiscal_entregada": state.get("constancia_fiscal_entregada", False)
         }

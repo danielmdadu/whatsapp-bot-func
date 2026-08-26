@@ -16,7 +16,7 @@ from maquinaria_config import machinery_config_service, get_required_fields_for_
 from state_management import ConversationState, ConversationStateStore, InMemoryStateStore, FIELDS_CONFIG_PRIORITY
 from datetime import datetime, timezone
 import logging
-from hubspot_manager import HubSpotManager
+from odoo_manager import OdooManager
 from inventory_service import InventoryService
 from company_profile import (
     CoverageStatus,
@@ -1306,7 +1306,7 @@ class IntelligentLeadQualificationChatbot:
             "messages": [],
             "conversation_mode": "bot", # agente o bot
             "asignado_asesor": None,
-            "hubspot_contact_id": None,
+            "odoo_lead_id": None,
             "quiere_cotizacion": None,
             "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
             "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
@@ -1373,10 +1373,12 @@ class IntelligentLeadQualificationChatbot:
         else:
             return "Gracias por la información. Pronto te contactará nuestro asesor especializado."
     
-    def send_message(self, user_message: str, whatsapp_message_id: str = None, hubspot_manager: HubSpotManager = None) -> str:
+    def send_message(self, user_message: str, whatsapp_message_id: str = None, odoo_manager: OdooManager = None) -> str:
         """
         Procesa un mensaje del usuario con slot-filling inteligente.
-        Si hubspot_manager es None, no se actualiza el contacto en HubSpot (para poder usar test_chatbot.py)
+        Si odoo_manager es None, no se actualiza el lead en Odoo (para poder usar
+        test_chatbot.py). La actualización en Odoo es best-effort: si falla, se
+        loguea y la conversación continúa sin interrupción.
         """
         
         try:
@@ -1406,7 +1408,7 @@ class IntelligentLeadQualificationChatbot:
             debug_print(f"DEBUG: Información extraída: {extracted_info}")
 
             # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
-            # ANTES de actualizar HubSpot y el estado para que el tipo de maquinaria
+            # ANTES de actualizar Odoo y el estado para que el tipo de maquinaria
             # inferido llegue a los dos.
             self._machine_ref = self._detect_and_merge_machine_reference(user_message, extracted_info)
 
@@ -1414,9 +1416,14 @@ class IntelligentLeadQualificationChatbot:
             # negarlas contra el inventario al generar la respuesta.
             self._detect_and_store_brands(user_message)
 
-            # Actualizar el contacto en HubSpot
-            if hubspot_manager:
-                hubspot_manager.update_contact(self.state, extracted_info)
+            # Actualizar el lead en Odoo. Best-effort: OdooManager ya atrapa sus
+            # propios errores, pero se envuelve también aquí para garantizar que
+            # nada de esta integración pueda interrumpir la conversación con el lead.
+            if odoo_manager:
+                try:
+                    odoo_manager.update_lead(self.state, extracted_info)
+                except Exception as e:
+                    debug_print(f"DEBUG: Error actualizando lead en Odoo (no bloqueante): {e}")
 
             # Actualizar el estado con la información extraída
             self._update_state_with_extracted_info(extracted_info)
@@ -1476,7 +1483,7 @@ class IntelligentLeadQualificationChatbot:
         # un lead que manda "PDSG900VR" quiere un compresor, no hace falta
         # preguntárselo. Se inyecta en extracted_info (en lugar de escribir el
         # estado directo) para que apliquen las validaciones de
-        # _update_state_with_extracted_info y para que el dato llegue a HubSpot.
+        # _update_state_with_extracted_info y para que el dato llegue a Odoo.
         if not extracted_info.get("tipo_maquinaria") and not self.state.get("tipo_maquinaria"):
             extracted_info["tipo_maquinaria"] = ref.categoria
             debug_print(
@@ -1969,7 +1976,7 @@ class IntelligentLeadQualificationChatbot:
             # giro del lead. Cuando el lead responde con un código en lugar de
             # contestar (ej. "PDSG900VR" a "¿Con quién tengo el gusto?"), el LLM a
             # veces lo clasifica como nombre. Guardarlo contaminaría el estado y el
-            # contacto de HubSpot con un dato falso imposible de corregir después.
+            # lead en Odoo con un dato falso imposible de corregir después.
             if key in ("nombre", "apellido", "giro_empresa") and looks_like_machine_code(value):
                 logging.warning(
                     f"Descartado '{key}'='{value}': parece el código de una máquina, no un dato del lead."
