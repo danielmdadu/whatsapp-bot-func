@@ -187,6 +187,33 @@ def _is_distribuidor(giro: str) -> bool:
             return True
     return False
 
+
+def _is_valid_business_activity(value: Any) -> bool:
+    """Descarta datos de contacto que el extractor confunda con el giro."""
+    if not isinstance(value, str):
+        return False
+
+    activity = value.strip()
+    if not activity or "\n" in activity or "\r" in activity:
+        return False
+    if re.search(r"\b[^\s@]+@[^\s@]+\.[^\s@]+\b", activity):
+        return False
+    if re.search(r"(?:https?://|www\.)", activity, re.IGNORECASE):
+        return False
+    return True
+
+
+def _sanitize_extracted_info(extracted_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Elimina valores inválidos antes de persistirlos en estado o CRM."""
+    sanitized = dict(extracted_info)
+    giro = sanitized.get("giro_empresa")
+    if giro is not None and not _is_valid_business_activity(giro):
+        sanitized.pop("giro_empresa")
+        logging.warning(
+            "Descartado giro_empresa: contiene datos de contacto o no describe una actividad."
+        )
+    return sanitized
+
 def _is_compresor_estacionario(current_state: dict) -> bool:
     """Verifica si el lead está solicitando un compresor estacionario.
     En ese caso, el bot no cotiza automáticamente y deriva a un asesor."""
@@ -941,6 +968,9 @@ class IntelligentResponseGenerator:
                 prefijo_aclaraciones = f"{prefijo_aclaraciones}\n\n" if prefijo_aclaraciones else ""
 
                 if recommended_machines:
+                    current_state["sin_coincidencias_contexto"] = None
+                    current_state["derivacion_asesor_confirmada"] = False
+                    current_state["recordatorios_derivacion_asesor"] = 0
                     # Formatear lista de máquinas recomendadas
                     machines_list = ""
                     recommended_models = []  # Lista de modelos para guardar en el estado
@@ -990,10 +1020,37 @@ class IntelligentResponseGenerator:
 {machines_list}
 {cierre_cotizacion}"""
                 else:
-                     # Fallback si no hay coincidencias exactas
+                    # Fallback si no hay coincidencias exactas. El contexto permite
+                    # volver a informar si el lead cambia de equipo o especificaciones.
+                    no_match_context = json.dumps(
+                        {
+                            "tipo_maquinaria": machine_type,
+                            "detalles_maquinaria": detalles,
+                        },
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    already_informed = current_state.get("sin_coincidencias_contexto") == no_match_context
+
+                    if already_informed:
+                        if not current_state.get("derivacion_asesor_confirmada"):
+                            current_state["derivacion_asesor_confirmada"] = True
+                            return "Perfecto. Un asesor experto se pondrá en contacto contigo para buscar una alternativa."
+
+                        reminders = current_state.get("recordatorios_derivacion_asesor", 0)
+                        current_state["recordatorios_derivacion_asesor"] = reminders + 1
+                        if reminders == 0:
+                            return "Tu solicitud ya quedó registrada. Un asesor se pondrá en contacto contigo por este medio."
+                        return "No necesitas volver a solicitarlo; el asesor continuará contigo por este medio en cuanto esté disponible."
+
+                    current_state["sin_coincidencias_contexto"] = no_match_context
+                    current_state["derivacion_asesor_confirmada"] = False
+                    current_state["recordatorios_derivacion_asesor"] = 0
                     # Con aclaración de marcas previa, el "Entendido." sobra.
                     entendido = "" if prefijo_aclaraciones else "Entendido. "
                     if current_state.get("quiere_cotizacion") is True:
+                        current_state["derivacion_asesor_confirmada"] = True
                         return f"""{prefijo_aclaraciones}{entendido}No manejamos una máquina en el inventario con esas características, pero un asesor experto te buscará una alternativa para cotizarte."""
                     else:
                         return f"""{prefijo_aclaraciones}{entendido}No manejamos una máquina en el inventario con esas características, pero tenemos muchas opciones que podrían adaptarse.
@@ -1369,6 +1426,9 @@ class IntelligentLeadQualificationChatbot:
             "completed": False,
             "cotizacion_enviada": False,  # True cuando ya se envió la respuesta final (evita ciclo)
             "cierre_ofrecido": False,  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
+            "sin_coincidencias_contexto": None,
+            "derivacion_asesor_confirmada": False,
+            "recordatorios_derivacion_asesor": 0,
             "messages": [],
             "conversation_mode": "bot", # agente o bot
             "asignado_asesor": None,
@@ -1471,6 +1531,7 @@ class IntelligentLeadQualificationChatbot:
             # Obtener la última pregunta del bot para contexto
             last_bot_question, _ = self._get_last_bot_question()
             extracted_info = self.slot_filler.extract_all_information(user_message, self.state, last_bot_question)
+            extracted_info = _sanitize_extracted_info(extracted_info)
             debug_print(f"DEBUG: Información extraída: {extracted_info}")
 
             # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
@@ -1762,6 +1823,13 @@ class IntelligentLeadQualificationChatbot:
         Añade un mensaje al estado y devuelve la respuesta final
         Si es un mensaje del bot y hay callback disponible, envía por WhatsApp primero
         """
+        has_previous_bot_message = any(
+            message.get("role") == "assistant" or message.get("sender") == "bot"
+            for message in self.state.get("messages", [])
+        )
+        if not has_previous_bot_message and "alphi" not in response.lower():
+            response = f"Hola, soy Alphi, asesor comercial de Alpha C. {response}"
+
         whatsapp_message_id = ""
         
         # Enviar mensaje por WhatsApp primero
@@ -1987,6 +2055,7 @@ class IntelligentLeadQualificationChatbot:
         Actualiza el estado con la información extraída, confiando en el
         pre-procesamiento y formato realizado por el LLM.
         """
+        extracted_info = _sanitize_extracted_info(extracted_info)
         debug_print(f"DEBUG: Actualizando estado con información: {extracted_info}")
 
         # Pre-check: si el flujo ya estaba cerrado y llega nueva info de maquinaria,
@@ -2222,7 +2291,8 @@ class IntelligentLeadQualificationChatbot:
                     # NO tomarlo como giro: se re-preguntará y el bot reconocerá la máquina.
                     if (last_user_msg
                             and len(last_user_msg) < 100  # Respuesta razonable, no un párrafo largo
-                            and not looks_like_machine_code(last_user_msg)):
+                            and not looks_like_machine_code(last_user_msg)
+                            and _is_valid_business_activity(last_user_msg)):
                         self.state["giro_empresa"] = last_user_msg
                         debug_print(f"DEBUG: Inferido giro_empresa='{last_user_msg}' por contexto de pregunta sobre giro.")
 
@@ -2250,7 +2320,8 @@ class IntelligentLeadQualificationChatbot:
             # 1. Intentar resolver contra las máquinas recomendadas
             if maquinas_recomendadas:
                 for full_model in maquinas_recomendadas:
-                    if partial_lower in full_model.lower() and partial_lower != full_model.lower():
+                    full_model_lower = full_model.lower().strip()
+                    if (partial_lower in full_model_lower or full_model_lower in partial_lower) and partial_lower != full_model_lower:
                         debug_print(f"DEBUG: maquina_seleccionada resolved (recomendadas): '{maquina_sel}' → '{full_model}'")
                         self.state["maquina_seleccionada"] = full_model
                         resolved = True

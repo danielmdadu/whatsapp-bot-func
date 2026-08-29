@@ -111,10 +111,24 @@ python test_chatbot.py
 ```
 Esto ejecutará escenarios predefinidos (Usuario directo, Usuario con múltiples datos, Usuario indeciso, etc.) y generará reportes en la carpeta `test_results`.
 
-Para probar manualmente en consola interactiva (chat en terminal):
-1. Abrir `test_chatbot.py`.
-2. Asegurar que `test_manually(chatbot_instance)` esté descomentado en el bloque `if __name__ == "__main__":`.
-3. Ejecutar el script y chatear con el bot en la terminal.
+También se pueden ejecutar flujos específicos mediante `--tests`. La selección acepta números individuales, rangos y combinaciones separados por comas:
+```bash
+# Ejecutar un solo flujo
+python test_chatbot.py --tests 42
+
+# Ejecutar varios flujos individuales
+python test_chatbot.py --tests "4,7,14"
+
+# Ejecutar un rango y combinarlo con otros flujos
+python test_chatbot.py --tests "5-15,20,22"
+```
+
+Cada ejecución informa qué flujos se ejecutaron, cuáles no están definidos y cuáles fallaron. Los reportes detallados se guardan en `test_results`.
+
+Para iniciar el chat interactivo en la terminal, sin modificar ni comentar código:
+```bash
+python test_chatbot.py --manual
+```
 
 ## Configuración y Despliegue
 

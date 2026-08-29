@@ -29,6 +29,9 @@ class ConversationState(TypedDict):
     asignado_asesor: Optional[str]
     completed: bool
     cierre_ofrecido: bool  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
+    sin_coincidencias_contexto: Optional[str]  # Requerimiento para el que ya se informó falta de inventario
+    derivacion_asesor_confirmada: bool  # Evita repetir el mismo handoff en turnos posteriores
+    recordatorios_derivacion_asesor: int  # Varía la respuesta si el lead insiste en el handoff
     # ID del lead en Odoo
     odoo_lead_id: Optional[int]
     # Control del flujo de cotización
