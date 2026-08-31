@@ -1,5 +1,6 @@
 
-from typing import List, Dict, Any, Union
+from dataclasses import dataclass
+from typing import List, Dict, Any, Union, Optional
 import re
 import unicodedata
 from maquinaria_config import machinery_config_service
@@ -11,6 +12,14 @@ try:
 except ImportError:
     local_inventory = []
     print("Warning: Could not import local inventory from update_invertory_db.inventory_data")
+
+
+@dataclass(frozen=True)
+class ModelInventoryLookup:
+    status: str  # "found" | "not_found" | "unavailable" | "ambiguous"
+    requested_code: str
+    model: Optional[str] = None
+    category: Optional[str] = None
 
 class InventoryService:
     """
@@ -34,6 +43,62 @@ class InventoryService:
         
         # Pricing service for SQL Server price lookups
         self._pricing_service = get_pricing_service()
+
+    @staticmethod
+    def _normalize_model(value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", str(value or ""))
+        without_accents = "".join(c for c in normalized if not unicodedata.combining(c))
+        return re.sub(r"[^A-Z0-9]", "", without_accents.upper())
+
+    def lookup_exact_model(self, requested_code: str) -> ModelInventoryLookup:
+        """Verifica un código de modelo exclusivamente contra Cosmos DB."""
+        normalized_code = self._normalize_model(requested_code)
+        if not normalized_code or not self.container:
+            return ModelInventoryLookup("unavailable", requested_code)
+
+        query = """
+            SELECT c.modelo, c.categoria
+            FROM c
+            WHERE CONTAINS(
+                REPLACE(REPLACE(UPPER(c.modelo), "-", ""), " ", ""),
+                @model_code
+            )
+        """
+        try:
+            items = list(self.container.query_items(
+                query=query,
+                parameters=[{"name": "@model_code", "value": normalized_code}],
+                enable_cross_partition_query=True,
+            ))
+        except Exception as exc:
+            print(f"Error verificando modelo en Cosmos: {exc}")
+            return ModelInventoryLookup("unavailable", requested_code)
+
+        matches = []
+        for item in items:
+            model = str(item.get("modelo") or "").strip()
+            normalized_model = self._normalize_model(model)
+            if normalized_model == normalized_code or normalized_model.endswith(normalized_code):
+                matches.append(item)
+
+        if not matches:
+            return ModelInventoryLookup("not_found", requested_code)
+
+        exact_matches = [
+            item for item in matches
+            if self._normalize_model(item.get("modelo")) == normalized_code
+        ]
+        selected = exact_matches or matches
+        if len(selected) != 1:
+            return ModelInventoryLookup("ambiguous", requested_code)
+
+        machine = selected[0]
+        return ModelInventoryLookup(
+            "found",
+            requested_code,
+            model=str(machine.get("modelo") or "").strip(),
+            category=str(machine.get("categoria") or "").strip(),
+        )
 
     def find_matching_machines(self, machine_type: str, requirements: Dict[str, Any], brands: List[str] = None) -> List[Dict[str, Any]]:
         """

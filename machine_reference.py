@@ -76,7 +76,7 @@ class MachineReference:
     categoria: str              # type_id de maquinaria ("compresor")
     modelo: Optional[str]       # Modelo canónico de nuestro inventario, si se resolvió
     en_inventario: bool         # True si ese modelo exacto sí lo manejamos
-    confianza: str              # "exacta" | "parcial" | "familia"
+    confianza: str              # "cosmos_exacta" | "cosmos_no_encontrada" | "exacta" | "parcial" | "familia"
 
 
 # ============================================================================
@@ -191,6 +191,17 @@ def looks_like_machine_code(text: Optional[str]) -> bool:
         if _is_code_token(token):
             return True
     return False
+
+
+def extract_machine_code_candidate(message: Optional[str]) -> Optional[str]:
+    """Extrae el primer código de modelo explícito sin consultar inventario."""
+    if not message:
+        return None
+
+    for token in _raw_tokens(message):
+        if _is_code_token(_normalize(token)):
+            return token
+    return None
 
 
 def detect_machine_reference(message: Optional[str]) -> Optional[MachineReference]:

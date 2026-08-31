@@ -38,6 +38,7 @@ from brand_reference import (
 from machine_reference import (
     MachineReference,
     detect_machine_reference,
+    extract_machine_code_candidate,
     looks_like_machine_code,
 )
 
@@ -614,7 +615,8 @@ class IntelligentSlotFiller:
 
             # 4. DETALLES DE MAQUINARIA
             # Verificar si faltan detalles específicos
-            if not self._are_maquinaria_details_complete(current_state):
+            if (not current_state.get("modelo_verificado_inventario")
+                    and not self._are_maquinaria_details_complete(current_state)):
                 question_details = self._get_maquinaria_detail_question_with_reason(current_state)
                 if question_details:
                     return question_details
@@ -799,22 +801,24 @@ class IntelligentSlotFiller:
         if not tipo_maquinaria:
             return False
         
-        # Verificar detalles de maquinaria
-        detalles = current_state.get("detalles_maquinaria", {})
-        
-        if not detalles:
-            return False
-        
-        # Usar la configuración centralizada para obtener campos obligatorios (con contexto)
-        required_fields = self._get_contextual_required_fields(current_state)
-        
-        if not all(
-            field in detalles and 
-            detalles[field] is not None and 
-            detalles[field] != ""
-            for field in required_fields
-        ):
-            return False
+        # Un modelo exacto confirmado en Cosmos ya aporta la especificación del
+        # equipo; no hace falta volver a preguntar sus detalles técnicos.
+        if not current_state.get("modelo_verificado_inventario"):
+            detalles = current_state.get("detalles_maquinaria", {})
+
+            if not detalles:
+                return False
+
+            # Usar la configuración centralizada para obtener campos obligatorios (con contexto)
+            required_fields = self._get_contextual_required_fields(current_state)
+
+            if not all(
+                field in detalles and
+                detalles[field] is not None and
+                detalles[field] != ""
+                for field in required_fields
+            ):
+                return False
 
         # Verificar si quiere cotización
         quiere_cot = current_state.get("quiere_cotizacion")
@@ -1257,7 +1261,7 @@ class IntelligentResponseGenerator:
         if not machine_reference or not next_question:
             return ""
 
-        if question_type in _MACHINERY_QUESTION_TYPES:
+        if machine_reference.en_inventario and question_type in _MACHINERY_QUESTION_TYPES:
             return ""
 
         if machine_reference.en_inventario and machine_reference.modelo:
@@ -1268,9 +1272,9 @@ class IntelligentResponseGenerator:
             )
         else:
             contexto = (
-                f"Ese código corresponde a un equipo del tipo '{machine_reference.categoria}'. "
-                "NO afirmes que manejamos ese modelo exacto (no está en nuestro inventario), "
-                "pero tampoco lo niegues: solo reconoce el interés."
+                f"El modelo exacto '{machine_reference.texto}' NO aparece en el inventario real. "
+                "Díselo claramente: no contamos con ese modelo. Después aclara que sí manejamos "
+                "otras máquinas y continúa con la pregunta pendiente para ofrecer alternativas."
             )
 
         return f"""
@@ -1417,6 +1421,7 @@ class IntelligentLeadQualificationChatbot:
 
         # Referencia a máquina detectada en el mensaje del turno actual (si hubo)
         self._machine_ref: Optional[MachineReference] = None
+        self._model_lookup_status: Optional[str] = None
         self._coverage: Optional[CoverageStatus] = None
 
     def _create_empty_state(self) -> ConversationState:
@@ -1436,6 +1441,7 @@ class IntelligentLeadQualificationChatbot:
             "quiere_cotizacion": None,
             "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
             "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
+            "modelo_verificado_inventario": False,
             "marcas_solicitadas": [],  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
             "marcas_aclaradas": False,  # True cuando el bot ya le respondió sobre esas marcas
             "cobertura_aclarada": False  # True cuando ya se le dijo que solo operamos en México
@@ -1554,6 +1560,7 @@ class IntelligentLeadQualificationChatbot:
 
             # Actualizar el estado con la información extraída
             self._update_state_with_extracted_info(extracted_info)
+            self._apply_model_lookup_to_state()
 
             # Después de actualizar el estado: el lugar del requerimiento puede
             # acabar de llegar y es parte del veredicto de cobertura.
@@ -1595,6 +1602,53 @@ class IntelligentLeadQualificationChatbot:
         Devuelve la referencia detectada (o None) para que la generación de
         respuesta pueda reconocerla antes de re-preguntar el dato pendiente.
         """
+        self._model_lookup_status = None
+        code_candidate = extract_machine_code_candidate(user_message)
+        if code_candidate:
+            brand_mentions = detect_brand_mentions(user_message)
+            requested_model = (
+                f"{brand_mentions[0]} {code_candidate}"
+                if brand_mentions else code_candidate
+            )
+            self.state["maquina_mencionada"] = requested_model
+            lookup = self.response_generator.inventory_service.lookup_exact_model(requested_model)
+            self._model_lookup_status = lookup.status
+
+            if lookup.status == "found" and lookup.model and lookup.category:
+                extracted_info["tipo_ayuda"] = "maquinaria"
+                extracted_info["tipo_maquinaria"] = lookup.category
+                extracted_info["maquina_seleccionada"] = lookup.model
+                extracted_info["quiere_cotizacion"] = True
+                return MachineReference(
+                    texto=requested_model,
+                    categoria=lookup.category,
+                    modelo=lookup.model,
+                    en_inventario=True,
+                    confianza="cosmos_exacta",
+                )
+
+            if lookup.status == "not_found":
+                categoria = (
+                    extracted_info.get("tipo_maquinaria")
+                    or self.state.get("tipo_maquinaria")
+                    or ""
+                )
+                return MachineReference(
+                    texto=requested_model,
+                    categoria=categoria,
+                    modelo=None,
+                    en_inventario=False,
+                    confianza="cosmos_no_encontrada",
+                )
+
+            if lookup.status in ("unavailable", "ambiguous"):
+                logging.warning(
+                    "No se pudo verificar de forma concluyente el modelo '%s' en Cosmos (%s).",
+                    requested_model,
+                    lookup.status,
+                )
+                return None
+
         ref = detect_machine_reference(user_message)
         if not ref:
             return None
@@ -1618,6 +1672,28 @@ class IntelligentLeadQualificationChatbot:
             )
 
         return ref
+
+    def _apply_model_lookup_to_state(self) -> None:
+        """Aplica el veredicto de Cosmos después de la actualización general."""
+        if not self._machine_ref:
+            return
+
+        if self._model_lookup_status == "found" and self._machine_ref.modelo:
+            self.state["tipo_ayuda"] = "maquinaria"
+            self.state["tipo_maquinaria"] = self._machine_ref.categoria
+            self.state["maquina_seleccionada"] = self._machine_ref.modelo
+            self.state["maquinas_recomendadas"] = [self._machine_ref.modelo]
+            self.state["quiere_cotizacion"] = True
+            self.state["modelo_verificado_inventario"] = True
+            return
+
+        if self._model_lookup_status == "not_found":
+            self.state["maquina_seleccionada"] = None
+            self.state["maquinas_recomendadas"] = []
+            self.state["quiere_cotizacion"] = None
+            self.state["modelo_verificado_inventario"] = False
+            self.state["completed"] = False
+            self.state["cotizacion_enviada"] = False
 
     def _evaluate_lead_coverage(self) -> CoverageStatus:
         """
@@ -1802,6 +1878,24 @@ class IntelligentLeadQualificationChatbot:
             self._try_send_ficha_tecnica()
 
             return result
+
+        # La disponibilidad de un modelo exacto viene de Cosmos y se comunica de
+        # forma determinista para que el LLM no la omita ni la contradiga.
+        if self._machine_ref and next_question_str:
+            if self._model_lookup_status == "found" and self._machine_ref.modelo:
+                response = (
+                    f"Sí contamos con el modelo {self._machine_ref.modelo} en nuestro inventario. "
+                    f"{next_question_str}"
+                )
+                return self._add_message_and_return_response(response, storage_question_type)
+
+            if self._model_lookup_status == "not_found":
+                response = (
+                    f"No contamos con el modelo {self._machine_ref.texto} en nuestro inventario. "
+                    "Sí manejamos otras máquinas que podrían ajustarse a lo que necesitas. "
+                    f"{next_question_str}"
+                )
+                return self._add_message_and_return_response(response, storage_question_type)
 
         # Generar respuesta con LLM (Llamada unificada)
         generated_response = self.response_generator.generate_response(
@@ -2082,6 +2176,7 @@ class IntelligentLeadQualificationChatbot:
                 self.state["maquinas_recomendadas"] = []
                 self.state["maquina_seleccionada"] = None
                 self.state["quiere_cotizacion"] = None
+                self.state["modelo_verificado_inventario"] = False
                 self.state["completed"] = False
                 self.state["cotizacion_enviada"] = False
                 # La conversación se reabre: el cierre vuelve a estar disponible
@@ -2117,6 +2212,7 @@ class IntelligentLeadQualificationChatbot:
                     self.state["maquinas_recomendadas"] = []
                     self.state["maquina_seleccionada"] = None
                     self.state["quiere_cotizacion"] = None
+                    self.state["modelo_verificado_inventario"] = False
                     self.state["completed"] = False
                     # Evitar que un quiere_cotizacion mal interpretado en ESTE mismo
                     # mensaje (ej: "sabes qué, mejor de 185A" leído como "no") termine
@@ -2209,6 +2305,7 @@ class IntelligentLeadQualificationChatbot:
                         self.state["maquinas_recomendadas"] = []
                         self.state["maquina_seleccionada"] = None
                         self.state["quiere_cotizacion"] = None
+                        self.state["modelo_verificado_inventario"] = False
                         self.state["completed"] = False
                 else:
                     logging.error(f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM.")

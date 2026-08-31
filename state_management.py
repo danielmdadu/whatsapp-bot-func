@@ -14,6 +14,7 @@ class ConversationState(TypedDict):
     maquina_seleccionada: Optional[str]  # Modelo de la máquina seleccionada para cotización
     maquinas_recomendadas: List[str]  # Lista de modelos recomendados (para mapear "la 1" a modelo)
     maquina_mencionada: Optional[str]  # Código/modelo que el lead mencionó por su cuenta (ej. "PDSG900VR")
+    modelo_verificado_inventario: bool  # Modelo exacto confirmado contra Cosmos DB
     marcas_solicitadas: List[str]  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
     marcas_aclaradas: bool  # True cuando el bot ya le respondió si manejamos esas marcas
     nombre_empresa: Optional[str]
