@@ -27,7 +27,7 @@ class ContentSafetyGuardrails:
         # Patrones de inyección de código a buscar
         code_patterns = [
             # Inyección SQL: busca palabras clave de SQL y patrones comunes de ataque.
-            r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|CREATE|ALTER)\b|--|;|\' OR \'1\'=\'1",
+            r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION|CREATE|ALTER)\b|--|\' OR \'1\'=\'1",
             
             # Inyección de comandos/código Python: busca funciones peligrosas y sintaxis común.
             r"\b(os\.system|subprocess|eval|exec|import|open)\b",

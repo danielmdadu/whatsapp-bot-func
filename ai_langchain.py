@@ -1,6 +1,7 @@
 import json
 import re
 import os
+import unicodedata
 from typing import Dict, Any, List, Optional, Tuple
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -10,7 +11,6 @@ from ai_prompts import (
     NEGATIVE_RESPONSE_PROMPT, 
     EXTRACTION_PROMPT, 
     RESPONSE_GENERATION_PROMPT, 
-    INVENTORY_DETECTION_PROMPT
 )
 from maquinaria_config import machinery_config_service, get_required_fields_for_tipo
 from state_management import ConversationState, ConversationStateStore, InMemoryStateStore, FIELDS_CONFIG_PRIORITY
@@ -204,14 +204,232 @@ def _is_valid_business_activity(value: Any) -> bool:
     return True
 
 
-def _sanitize_extracted_info(extracted_info: Dict[str, Any]) -> Dict[str, Any]:
+_MEASUREMENT_UNIT_PATTERNS = {
+    "amps": (r"\bamps?\b", r"\bamper(?:e|es|io|ios)\b"),
+    "cfm": (r"\bcfm\b",),
+    "kw": (r"\bkw\b", r"\bkilowatts?\b", r"\bkilovatios?\b"),
+    "toneladas": (r"\btoneladas?\b", r"\btons?\b"),
+    "m": (r"\bmetros?\b", r"\b\d+(?:[.,]\d+)?\s*m\b"),
+    "litros": (r"\blitros?\b", r"\b\d+(?:[.,]\d+)?\s*l(?:/min)?\b"),
+    "m3_h": (r"\bm3/h\b", r"\bm3 por hora\b", r"\bmetros cubicos por hora\b"),
+    "galones": (r"\bgalones?\b", r"\bgallons?\b", r"\bgpm\b"),
+    "psi": (r"\bpsi\b",),
+    "bar": (r"\bbar\b",),
+    "kpa": (r"\bkpa\b",),
+    "kva": (r"\bkva\b",),
+    "hp": (r"\bhp\b", r"\bcaballos de fuerza\b"),
+    "kg": (r"\bkg\b", r"\bkilogramos?\b"),
+    "libras": (r"\blbs?\b", r"\blibras?\b"),
+    "pies": (r"\bft\b", r"\bpies?\b"),
+    "cm": (r"\bcm\b", r"\bcentimetros?\b"),
+    "mm": (r"\bmm\b", r"\bmilimetros?\b"),
+}
+
+_CONFIG_UNIT_KEYS = {
+    "amp": "amps",
+    "amps": "amps",
+    "cfm": "cfm",
+    "kw": "kw",
+    "tonelada": "toneladas",
+    "toneladas": "toneladas",
+    "m": "m",
+}
+
+_QUESTION_STOPWORDS = {
+    "cual", "cuanto", "cuanta", "que", "para", "necesitas", "necesita",
+    "requiere", "requieres", "del", "las", "los", "una", "uno", "por",
+}
+
+
+def _normalize_measurement_text(value: Optional[str]) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    return "".join(char for char in normalized if not unicodedata.combining(char)).lower()
+
+
+def _contains_measurement_unit(text: str, unit_key: str) -> bool:
+    return any(re.search(pattern, text) for pattern in _MEASUREMENT_UNIT_PATTERNS.get(unit_key, ()))
+
+
+def _question_targets_field(question: Optional[str], field_question: str, expected_unit: str) -> bool:
+    normalized_question = _normalize_measurement_text(question)
+    if not normalized_question:
+        return False
+    if _contains_measurement_unit(normalized_question, expected_unit):
+        return True
+
+    configured_terms = {
+        term for term in re.findall(r"\b[a-z0-9]+\b", _normalize_measurement_text(field_question))
+        if len(term) >= 4 and term not in _QUESTION_STOPWORDS
+    }
+    return bool(configured_terms.intersection(re.findall(r"\b[a-z0-9]+\b", normalized_question)))
+
+
+def _discard_values_with_incompatible_units(
+    extracted_info: Dict[str, Any],
+    message: str,
+    last_bot_question: Optional[str],
+    current_state: Optional[ConversationState],
+) -> None:
+    details = extracted_info.get("detalles_maquinaria")
+    if not isinstance(details, dict):
+        return
+
+    machine_type = extracted_info.get("tipo_maquinaria")
+    if not machine_type and current_state:
+        machine_type = current_state.get("tipo_maquinaria")
+    config = machinery_config_service.get_config(machine_type) if machine_type else None
+    if not config:
+        return
+
+    normalized_message = _normalize_measurement_text(message)
+    sanitized_details = dict(details)
+
+    for field in config.fields:
+        if field.name not in sanitized_details or field.type != "number" or not field.unit:
+            continue
+
+        expected_unit = _CONFIG_UNIT_KEYS.get(_normalize_measurement_text(field.unit))
+        if not expected_unit:
+            continue
+
+        has_incompatible_unit = any(
+            unit_key != expected_unit and _contains_measurement_unit(normalized_message, unit_key)
+            for unit_key in _MEASUREMENT_UNIT_PATTERNS
+        )
+        has_expected_unit = _contains_measurement_unit(normalized_message, expected_unit)
+        is_direct_answer = _question_targets_field(last_bot_question, field.question, expected_unit)
+
+        if has_incompatible_unit or (not has_expected_unit and not is_direct_answer):
+            sanitized_details.pop(field.name)
+            logging.warning(
+                "Descartado %s: el mensaje no usa la unidad requerida %s.",
+                field.name,
+                field.unit,
+            )
+
+    if sanitized_details:
+        extracted_info["detalles_maquinaria"] = sanitized_details
+    else:
+        extracted_info.pop("detalles_maquinaria", None)
+
+
+def _build_unit_clarification_response(
+    message: str,
+    current_state: ConversationState,
+) -> Optional[str]:
+    machine_type = current_state.get("tipo_maquinaria")
+    config = machinery_config_service.get_config(machine_type) if machine_type else None
+    if not config:
+        return None
+
+    normalized_message = _normalize_measurement_text(message)
+    details = current_state.get("detalles_maquinaria")
+    details = details if isinstance(details, dict) else {}
+
+    for field in config.fields:
+        if field.type != "number" or not field.unit or details.get(field.name) not in (None, ""):
+            continue
+
+        expected_unit = _CONFIG_UNIT_KEYS.get(_normalize_measurement_text(field.unit))
+        if not expected_unit:
+            continue
+
+        has_incompatible_unit = any(
+            unit_key != expected_unit and _contains_measurement_unit(normalized_message, unit_key)
+            for unit_key in _MEASUREMENT_UNIT_PATTERNS
+        )
+        if has_incompatible_unit:
+            return (
+                f"Por ahora no puedo convertir otras unidades a {field.unit}. "
+                f"Para continuar, necesito que me compartas el valor directamente en {field.unit}."
+            )
+
+    return None
+
+
+def _is_explicit_catalog_request(message: str) -> bool:
+    normalized = _normalize_measurement_text(message)
+    words = set(re.findall(r"\b[a-z0-9]+\b", normalized))
+    question_words = {"que", "cuales"}
+    catalog_nouns = {"maquina", "maquinas", "maquinaria", "equipo", "equipos", "producto", "productos"}
+    catalog_verbs = {"maneja", "manejan", "tiene", "tienen", "vende", "venden", "ofrece", "ofrecen"}
+
+    known_type_tokens = {
+        token
+        for machinery_type in machinery_config_service.get_all_types()
+        for token in re.findall(
+            r"\b[a-z0-9]+\b",
+            _normalize_measurement_text(
+                f"{machinery_type.type_id} "
+                f"{machinery_config_service.get_type_display_name(machinery_type.type_id)}"
+            ),
+        )
+        if len(token) >= 4
+    }
+    mentions_specific_type = bool(words.intersection(known_type_tokens))
+
+    if "catalogo" in words or "lista" in words:
+        return not mentions_specific_type
+
+    asks_general_offering = bool(
+        words.intersection(question_words)
+        and words.intersection(catalog_nouns)
+        and words.intersection(catalog_verbs)
+    )
+    asks_types = bool(
+        words.intersection(question_words)
+        and words.intersection({"tipo", "tipos"})
+        and words.intersection({"maquinaria", "maquina", "maquinas", "equipo", "equipos"})
+    )
+    asks_what_is_sold = "que" in words and bool(words.intersection({"vende", "venden", "ofrece", "ofrecen"}))
+
+    return asks_general_offering or asks_types or (asks_what_is_sold and not mentions_specific_type)
+
+
+def _build_catalog_response(next_question: Optional[str] = None) -> str:
+    catalog = ", ".join(machinery_config_service.get_type_display_list())
+    response = f"En Alpha C manejamos: {catalog}."
+    if next_question:
+        response += f"\n\n{next_question}"
+    return response
+
+
+def _sanitize_extracted_info(
+    extracted_info: Dict[str, Any],
+    message: Optional[str] = None,
+    last_bot_question: Optional[str] = None,
+    current_state: Optional[ConversationState] = None,
+) -> Dict[str, Any]:
     """Elimina valores inválidos antes de persistirlos en estado o CRM."""
     sanitized = dict(extracted_info)
+    if (
+        sanitized.get("tipo_cliente") == "No tiene"
+        and last_bot_question
+        and any(
+            phrase in _normalize_measurement_text(last_bot_question)
+            for phrase in (
+                "venta o renta",
+                "venta/renta",
+                "para venta",
+                "uso propio",
+                "uso de la empresa",
+            )
+        )
+    ):
+        sanitized["tipo_cliente"] = "cliente_final"
+
     giro = sanitized.get("giro_empresa")
     if giro is not None and not _is_valid_business_activity(giro):
         sanitized.pop("giro_empresa")
         logging.warning(
             "Descartado giro_empresa: contiene datos de contacto o no describe una actividad."
+        )
+    if message is not None:
+        _discard_values_with_incompatible_units(
+            sanitized,
+            message,
+            last_bot_question,
+            current_state,
         )
     return sanitized
 
@@ -484,6 +702,8 @@ class IntelligentSlotFiller:
             response_type = negative_response.get("response_type")
             
             if field_name and response_type:
+                if field_name == "tipo_cliente" and response_type == "No tiene":
+                    response_type = "cliente_final"
                 extracted_data[field_name] = response_type
         
         # SEGUNDO: Extraer el resto de la información usando el prompt general
@@ -508,7 +728,11 @@ class IntelligentSlotFiller:
                 if config:
                    field_instructions = []
                    for field in config.fields:
-                       field_instructions.append(f"- Para {machine_type.upper()}: {field.name} ({field.question})")
+                       unit_instruction = f", unidad obligatoria: {field.unit}" if field.unit else ""
+                       field_instructions.append(
+                           f"- Para {machine_type.upper()}: {field.name} "
+                           f"({field.question}{unit_instruction})"
+                       )
                    machine_specific_fields = "\n".join(field_instructions)
             
             if not machine_specific_fields:
@@ -1372,25 +1596,8 @@ class InventoryResponder:
         self.inventory = get_inventory() # TODO: Mover esto también a DB si es necesario, por ahora usa el fake
 
     def is_inventory_question(self, message: str) -> bool:
-        """Determina si el mensaje del usuario es una pregunta sobre el inventario"""
-        try:
-            prompt = INVENTORY_DETECTION_PROMPT
-            
-            response = self.llm.invoke(prompt.format_prompt(
-                message=message
-            ))
-            
-            result = response.content.strip().lower()
-            
-            debug_print(f"DEBUG: ¿Es pregunta sobre inventario? '{message}' → {result}")
-            
-            return result == "true"
-            
-        except Exception as e:
-            logging.error(f"Error detectando pregunta de inventario: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+        """Determina si el usuario pidió explícitamente el catálogo general."""
+        return _is_explicit_catalog_request(message)
 
 # ============================================================================
 # CLASE PRINCIPAL DEL CHATBOT CON SLOT-FILLING INTELIGENTE
@@ -1537,7 +1744,12 @@ class IntelligentLeadQualificationChatbot:
             # Obtener la última pregunta del bot para contexto
             last_bot_question, _ = self._get_last_bot_question()
             extracted_info = self.slot_filler.extract_all_information(user_message, self.state, last_bot_question)
-            extracted_info = _sanitize_extracted_info(extracted_info)
+            extracted_info = _sanitize_extracted_info(
+                extracted_info,
+                user_message,
+                last_bot_question,
+                self.state,
+            )
             debug_print(f"DEBUG: Información extraída: {extracted_info}")
 
             # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
@@ -1779,12 +1991,19 @@ class IntelligentLeadQualificationChatbot:
             )
             return self._add_message_and_return_response(generated_response, "")
 
+        unit_clarification = _build_unit_clarification_response(user_message, self.state)
+        if unit_clarification:
+            return self._add_message_and_return_response(
+                unit_clarification,
+                "detalles_maquinaria",
+            )
+
         # ── Flujo normal ──
         is_inventory_question = False
 
         # Verificar si es una pregunta sobre inventario
         if self.inventory_responder.is_inventory_question(user_message):
-            debug_print(f"DEBUG: Pregunta sobre inventario detectada")
+            debug_print(f"DEBUG: Solicitud explícita de catálogo detectada")
             is_inventory_question = True
         
         # Si no es pregunta de inventario ni de requerimientos, continuar con el flujo normal
@@ -1795,6 +2014,29 @@ class IntelligentLeadQualificationChatbot:
             "role": msg["role"],
             "content": msg["content"]
         } for msg in self.state["messages"]]
+
+        if self.state.get("quiere_cotizacion") is False:
+            self.state["completed"] = True
+
+            if not self.state.get("cierre_ofrecido"):
+                self.state["cierre_ofrecido"] = True
+                return self._add_message_and_return_response(
+                    "De acuerdo, ¿hay algo más en lo que te pueda ayudar?",
+                    "",
+                )
+
+            generated_response = self.response_generator.generate_response(
+                user_message,
+                history_messages,
+                extracted_info,
+                self.state,
+                next_question=None,
+                is_inventory_question=is_inventory_question,
+                question_type="post_cierre",
+                machine_reference=self._machine_ref,
+                coverage=self._coverage,
+            )
+            return self._add_message_and_return_response(generated_response, "")
 
         next_question_str = None
         next_question_type = "conversation_complete"
@@ -1813,39 +2055,6 @@ class IntelligentLeadQualificationChatbot:
 
             if next_question_data is None:
                 debug_print(f"DEBUG: Estado completo (sin siguiente pregunta): {self.state}")
-                
-                # Caso especial: Si el usuario dijo "no" a la cotización
-                quiere_cot = self.state.get("quiere_cotizacion")
-                if quiere_cot is False:
-                    self.state["completed"] = True
-
-                    # El cierre se ofrece UNA sola vez. Antes se devolvía en cada
-                    # turno mientras quiere_cotizacion siguiera en False, así que
-                    # el lead recibía la misma pregunta contestara lo que
-                    # contestara ("sí", "no", "mantenimiento") y la conversación
-                    # quedaba en bucle (real_conversations_withLeads/7.json).
-                    if not self.state.get("cierre_ofrecido"):
-                        self.state["cierre_ofrecido"] = True
-                        final_message = "Okay, ¿hay algo más en lo que te pueda ayudar?"
-                        return self._add_message_and_return_response(final_message, "")
-
-                    # Ya se ofreció el cierre. Si el lead hubiera pedido otra
-                    # cotización, _update_state_with_extracted_info ya habría
-                    # reabierto el flujo y no estaríamos aquí; así que se le
-                    # responde con normalidad en vez de repetir la pregunta.
-                    generated_response = self.response_generator.generate_response(
-                        user_message,
-                        history_messages,
-                        extracted_info,
-                        self.state,
-                        next_question=None,
-                        is_inventory_question=is_inventory_question,
-                        question_type="post_cierre",
-                        machine_reference=self._machine_ref,
-                        coverage=self._coverage
-                    )
-                    return self._add_message_and_return_response(generated_response, "")
-
 
                 self.state["completed"] = True
                 # Se usan los valores por defecto
@@ -1896,6 +2105,12 @@ class IntelligentLeadQualificationChatbot:
                     f"{next_question_str}"
                 )
                 return self._add_message_and_return_response(response, storage_question_type)
+
+        if is_inventory_question:
+            return self._add_message_and_return_response(
+                _build_catalog_response(next_question_str),
+                storage_question_type,
+            )
 
         # Generar respuesta con LLM (Llamada unificada)
         generated_response = self.response_generator.generate_response(

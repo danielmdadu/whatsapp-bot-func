@@ -27,6 +27,11 @@ NEGATIVE_RESPONSE_PROMPT = ChatPromptTemplate.from_template(
     
     CAMPOS DISPONIBLES:
     {fields_available}
+
+    EXCEPCIÓN OBLIGATORIA PARA TIPO_CLIENTE:
+    - Si la pregunta es si se dedica a la venta/renta o si el equipo es para venta o uso propio, una respuesta negativa significa tipo_cliente="cliente_final".
+    - NUNCA devuelvas tipo_cliente con response_type "No tiene" o "No especificado".
+    - Ejemplo: "no me dedico a la venta o renta, es para uso de trabajo" → no es una ausencia de dato; debe clasificarse como cliente_final en la extracción general.
     
     Si NO es una respuesta negativa ni de incertidumbre, retorna "None".
     
@@ -113,13 +118,18 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     REGLAS ADICIONALES PARA DETALLES DE MAQUINARIA (PRIORIDAD MÁXIMA - STRICT MODE):
     {machine_specific_fields}
     - IMPORTANTE: Usa EXACTAMENTE los nombres de campos listados arriba (keys del JSON).
-    - NO uses sinónimos ni inventes nombres. Si el usuario dice "volumen", usa el campo correspondiente (ej. "caudal_cfm_max").
+    - NO uses sinónimos ni inventes nombres.
     - NO extraigas campos que no estén en esta lista.
     - PROHIBIDO inventar campos como: "proyecto", "aplicación", "capacidad_volumen", "capacidad_de_volumen", "volumen", etc.
     - IMPORTANTE: Si el usuario dice "para venta", extráelo como "tipo_cliente": "distribuidor", y NO como actividad en detalles_maquinaria.
     
     REGLAS ESPECIALES PARA VALORES NUMÉRICOS:
     - IMPORTANTE: Si un campo representa una cantidad numérica (ej. "altura_trabajo_m", "potencia_kw", "amperaje_amps_max", "capacidad_toneladas", "caudal_cfm_max", etc.), el valor extraído DEBE SER UN NÚMERO (INTEGER O FLOAT), NUNCA UN STRING.
+    - Respeta ESTRICTAMENTE la unidad indicada para cada campo. NO conviertas, estimes ni trates como equivalentes unidades distintas.
+    - Solo extrae un valor si el usuario escribe la unidad requerida o si responde con un número a una pregunta que pide explícitamente ese campo.
+    - Para "caudal_cfm_max", solo acepta CFM o una respuesta numérica directa a la pregunta de CFM. Litros, litros por minuto, m³/h y galones NO son CFM: no extraigas el campo y permite que el bot vuelva a solicitarlo.
+    - Ejemplo correcto: "200 CFM" → {{"detalles_maquinaria": {{"caudal_cfm_max": 200}}}}.
+    - Ejemplos incorrectos: "5000 litros" o "200 litros por minuto" → NO extraer "caudal_cfm_max".
     - Para PLATAFORMA, la altura SIEMPRE va en "altura_trabajo_m" (NUNCA uses "altura_plataforma_m"). Ej: "plataforma de 6 metros" → {{"detalles_maquinaria": {{"altura_trabajo_m": 6}}}}.
     - Ejemplos correctos: {{"detalles_maquinaria": {{"altura_trabajo_m": 11, "capacidad_toneladas": 3}}}}
     - Ejemplos correctos: {{"detalles_maquinaria": {{"potencia_kw": 20}}}}
@@ -344,6 +354,7 @@ RESPONSE_GENERATION_PROMPT = ChatPromptTemplate.from_template(
     7. EXPRESIONES DE CONFIRMACIÓN: Usa MÁXIMO UNA expresión de confirmación por mensaje (ej: "Perfecto", "Muy bien", "Entiendo", "De acuerdo"). NO combines múltiples expresiones como "Perfecto... Claro...". Una expresión de confirmación SOLO es apropiada para reconocer información que el usuario te ACABA de dar o para aceptar una petición suya; NUNCA la uses después de RESPONDER una pregunta del usuario (por ejemplo, tras una pregunta de precio). En particular, NUNCA pegues una palabra como "Claro" justo antes de pedir datos: enlaza directamente con la transición.
     8. PRECIOS: NUNCA reveles, inventes ni estimes el precio o costo de ninguna máquina en esta etapa. El precio se entrega ÚNICAMENTE en la cotización formal, después de que el usuario proporcione todos los datos solicitados. Si el usuario pregunta por el precio o costo, explícale de forma amable y breve que el precio se incluye en la cotización formal y que para generarla necesitas los datos que le estás pidiendo; luego continúa solicitando los datos pendientes. Bajo NINGUNA circunstancia menciones una cifra de precio.
     8.1 PETICIONES POR PRECIO (comparativas): Si el usuario pide una opción EN FUNCIÓN DEL PRECIO (ej.: "la más barata", "la más económica", "la más accesible", "la más cara", "la de menor/mayor precio"), NO la rankees por precio ni insinúes qué máquina es más barata o más cara (aún no tienes acceso a los precios). Reconoce de forma breve su interés por el presupuesto, aclara que el precio se entrega en la cotización formal, y CONTINÚA pidiendo la especificación técnica que falte (ej.: el tipo de plataforma) para poder recomendar. NUNCA presentes una máquina como "la más barata" ni "la más cara".
+    8.2 UNIDADES: NO conviertas, calcules ni estimes equivalencias entre unidades técnicas. Si el usuario responde en una unidad distinta de la solicitada, aclara brevemente que necesitas el dato en la unidad indicada y vuelve a pedirlo. NUNCA prometas calcular o recomendar una equivalencia.
     9. TIPOS DE MAQUINARIA: Si el usuario pregunta qué máquinas o tipos manejan/tienen, enuméralos EXCLUSIVAMENTE a partir de la lista "TIPOS DE MAQUINARIA VÁLIDOS" de arriba. NUNCA menciones ni inventes tipos que no estén en esa lista (por ejemplo: taladros, retroexcavadoras, excavadoras, etc.). NO uses "entre otros" ni sugieras que existen más tipos de los listados.
     9.1 LA EMPRESA: NUNCA confirmes una afirmación sobre Alpha C (ubicación, sucursales, países donde operamos, tamaño, antigüedad) solo porque el usuario la dio por hecha en su pregunta. La ÚNICA fuente válida es el bloque "QUIÉNES SOMOS" de arriba. Si te preguntan algo de la empresa que no está ahí, dile que un asesor se lo confirma; NO lo inventes.
     10. MARCAS: NUNCA afirmes ni niegues que manejamos una marca por tu cuenta. La ÚNICA fuente válida es el bloque "DISPONIBILIDAD DE MARCAS" cuando aparezca arriba. Si el usuario menciona una marca y ese bloque NO está presente, NO digas que la manejamos ni que no la manejamos: continúa con la pregunta pendiente sin pronunciarte sobre la marca. PROHIBIDO decir "manejamos [marca]" si esa marca no aparece como disponible en ese bloque.
