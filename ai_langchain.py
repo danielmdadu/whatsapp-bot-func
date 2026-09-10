@@ -40,6 +40,7 @@ from machine_reference import (
     detect_machine_reference,
     extract_machine_code_candidate,
     looks_like_machine_code,
+    segment_containing_code,
 )
 
 langchain.debug = False
@@ -177,20 +178,234 @@ _MACHINERY_QUESTION_TYPES = {
     "seleccion_maquina",
 }
 
+# Veces que el bot puede preguntar el tipo de maquinaria con la pregunta genérica
+# antes de cambiar de estrategia. Si a la tercera seguimos sin tipo, el problema
+# no es que el lead no haya contestado (normalmente ya contestó dos veces): es
+# que no logramos mapear lo que escribió a un tipo del catálogo. Repetir la misma
+# pregunta solo hace que el lead conteste "ya lo dije arriba". En su lugar se le
+# muestra la lista literal de tipos que manejamos, que sí es accionable.
+_MAX_PREGUNTAS_TIPO_MAQUINARIA = 2
+
+# Lo que un lead escribe cuando busca una REFACCIÓN y no una máquina. En México
+# es casi siempre "refacción"; "repuesto" es el sinónimo regional. Se mantiene
+# corto a propósito: "pieza" o "parte" aparecen en demasiadas frases que no
+# tienen nada que ver ("la parte de arriba", "una pieza clave del proyecto").
+_REFACCION_RE = re.compile(r"\brefacc\w*|\brepuest\w*")
+
+# Verbos con los que se PIDE algo. Negar uno de ellos sí cambia la intención;
+# negar cualquier otro NO. Esta distinción es el corazón del clasificador:
+#
+#   "no busco refacciones, quiero la maquina"  → NO quiere refacción
+#   "no tengo la refaccion"                    → SÍ quiere una refacción
+#   "no se si tienen refacciones"              → SÍ quiere una refacción
+#
+# Buscar un "no" cerca de la palabra (la solución ingenua) se equivoca en los
+# dos últimos casos, que son los más frecuentes.
+_VERBOS_PETICION = r"(?:busc|necesit|quier|requier|pid|ocup|solicit|and)\w*"
+_NEGACION_PETICION_RE = re.compile(
+    rf"\b(?:no|ya\s+no|nunca|tampoco|nada\s+de)\s+(?:me\s+|te\s+|le\s+|se\s+)?{_VERBOS_PETICION}"
+)
+
+# El otro modo de descartar: negar el sustantivo directamente ("nada de
+# refacciones", "sin refacciones"). Entre el negador y la palabra solo se
+# admiten artículos y preposiciones, NUNCA un verbo: así "no TENGO la
+# refaccion" y "no SE si tienen refacciones" no caen aquí, que es justo donde
+# se rompe la detección ingenua de negación.
+_NEGACION_DIRECTA_RE = re.compile(
+    r"\b(?:nada\s+de|sin|ni|no)\s+(?:mas\s+)?(?:de\s+)?"
+    r"(?:las?\s+|los\s+|unas?\s+|unos\s+)?(?:refacc|repuest)\w*"
+)
+
+# Señales de que lo que quiere es la MÁQUINA COMPLETA. No bastan para decidir
+# por sí solas (ver _clasificar_intencion_refaccion), solo para dudar.
+_COMPRA_MAQUINA_RE = re.compile(
+    r"\b(?:maquina|equipo)s?\s+(?:nuev|complet)\w*"
+    r"|\b(?:comprar|adquirir|cotizar|cotiza|cotizame|rentar)\s+(?:me\s+)?"
+    r"(?:una?\s+|el\s+|la\s+|los\s+|las\s+)?(?:maquina|equipo)s?\b"
+)
+
+
+def _clasificar_intencion_refaccion(message: Optional[str]) -> str:
+    """
+    Clasifica la intención del mensaje respecto a refacciones.
+
+    Devuelve:
+      "refaccion"  – pide una refacción; el flujo debe ir a `tipo_ayuda="otro"`.
+      "maquina"    – descarta explícitamente la refacción y quiere la máquina.
+      "indefinido" – no hay señal, o las señales se contradicen: NO decidimos
+                     aquí y lo resuelve la extracción del LLM.
+
+    El daño de equivocarse es ASIMÉTRICO y por eso el clasificador es cauto:
+    encaminar por error a un comprador hacia refacciones cuesta una venta,
+    mientras que dejar pasar una refacción al flujo de maquinaria solo cuesta
+    unos turnos. Ante evidencia contradictoria se devuelve "indefinido".
+    """
+    normalizado = _normalize_measurement_text(message)
+    if not _REFACCION_RE.search(normalizado):
+        return "indefinido"
+
+    # Descarte explícito: se niega el verbo con el que se pide la refacción,
+    # o se niega la refacción misma.
+    if _NEGACION_PETICION_RE.search(normalizado) or _NEGACION_DIRECTA_RE.search(normalizado):
+        return "maquina"
+
+    # Menciona la refacción Y la compra de una máquina en el mismo mensaje.
+    # Puede ser cualquiera de las dos ("una refacción para mi cortadora nueva"
+    # vs "mejor cotízame la máquina"): sin negación no hay forma determinista
+    # de saberlo, así que no se decide aquí.
+    # Solo cuenta una intención de compra EXPLÍCITA ("cotízame la máquina").
+    # Deliberadamente no se usa "nuevo/nueva + tipo de máquina": "una refacción
+    # para mi generador nuevo" describe la máquina que el lead YA tiene, y
+    # tratarlo como duda degradaría peticiones de refacción perfectamente claras.
+    if _COMPRA_MAQUINA_RE.search(normalizado):
+        return "indefinido"
+
+    return "refaccion"
+
+
+def _menciona_refacciones(message: Optional[str]) -> bool:
+    """True si el mensaje pide una refacción de forma inequívoca."""
+    return _clasificar_intencion_refaccion(message) == "refaccion"
+
+
+# Señales que POR SÍ SOLAS identifican a un distribuidor: nombran el rol, no una
+# actividad que pueda ser de otra cosa.
+_GIRO_DISTRIBUIDOR_FUERTE = ("distribuidor", "distribuidora", "reventa", "revendedor")
+
+# Actividades comerciales que cuentan como distribución salvo que el lead diga
+# explícitamente que vende o renta OTRA cosa ("venta de abarrotes"). A secas
+# conservan el sentido de la pregunta que originó el dato: "¿te dedicas a la
+# venta o renta de maquinaria?".
+_GIRO_ACTIVIDAD_COMERCIAL = ("venta", "renta", "alquiler", "arrendamiento", "distribucion")
+
+# Actividades demasiado genéricas para decidir solas: una "comercializadora"
+# puede vender alimentos o acero. Solo cuentan si el objeto es maquinaria.
+_GIRO_ACTIVIDAD_AMBIGUA = ("comercializadora", "comercializacion", "comercio")
+
+# El objeto que vuelve "de distribución" a una actividad comercial.
+_OBJETO_MAQUINARIA = ("maquinaria", "maquina", "equipo", "herramienta", "refaccion", "motor")
+
+_OBJETO_DE_LA_ACTIVIDAD_RE = re.compile(
+    r"\b(?:venta|renta|alquiler|arrendamiento|distribucion|comercializacion|comercializadora|comercio)\b"
+    r"(?:\s+y\s+\w+)?\s+de\s+(?:la\s+|el\s+|los\s+|las\s+)?(?P<objeto>.{2,60})"
+)
+
+
+def _es_objeto_de_maquinaria(objeto: str) -> bool:
+    """True si lo que el lead vende/renta es maquinaria y no otra mercancía."""
+    if any(palabra in objeto for palabra in _OBJETO_MAQUINARIA):
+        return True
+    # El catálogo también sirve de vocabulario: "venta de compresores".
+    return bool(machinery_config_service.resolve_type_ids(objeto))
+
+
+# Orden en que se aplican los campos extraídos. Sin esto, el resultado dependía
+# del orden en que el LLM emitiera las llaves de su JSON, que no controlamos:
+#
+#   "y me puedes cotizar también una plataforma de 10 metros" con el estado en
+#   tipo_maquinaria="generador" devolvía {detalles: {altura_trabajo_m: 10},
+#   tipo_maquinaria: "plataforma"}. Al procesar los detalles PRIMERO se
+#   guardaba la altura, y enseguida la limpieza por cambio de tipo la borraba:
+#   el bot quedaba pidiendo la altura de trabajo para siempre (6 veces
+#   seguidas en el Flujo 9) sobre un dato que el lead ya había dado.
+#
+# La limpieza por cambio de tipo debe descartar los detalles de la máquina
+# ANTERIOR, no los de la nueva que llegaron en el mismo mensaje. Fijar el orden
+# lo garantiza sin importar qué mande el LLM.
+_PRIORIDAD_DE_CAMPO = {
+    "tipo_ayuda": 0,
+    # Antes que los detalles: su limpieza deja el terreno listo para ellos.
+    "tipo_maquinaria": 1,
+    # 'apellido' se concatena sobre 'nombre', así que el nombre va primero.
+    "nombre": 2,
+    "apellido": 3,
+    # Al final: se fusionan sobre los detalles ya depurados.
+    "detalles_maquinaria": 99,
+}
+_PRIORIDAD_POR_DEFECTO = 50
+
+
+def _orden_de_aplicacion(item: Tuple[str, Any]) -> Tuple[int, str]:
+    key = item[0]
+    return (_PRIORIDAD_DE_CAMPO.get(key, _PRIORIDAD_POR_DEFECTO), key)
+
+
 def _is_distribuidor(giro: str) -> bool:
-    """Verifica si el giro corresponde a un distribuidor basado en palabras clave."""
+    """
+    True si el giro corresponde a un distribuidor de maquinaria.
+
+    Antes bastaba con que el texto contuviera "venta" o "renta" en cualquier
+    parte, sin mirar DE QUÉ: una empresa cuyo giro es "venta de abarrotes" o
+    "renta de inmuebles" quedaba marcada como distribuidora de maquinaria y se
+    le negaba la cotización directa. Del otro lado, "comercializadora de
+    maquinaria" —que sí lo es— no daba ninguna coincidencia.
+    """
     if not giro:
         return False
-    g = giro.lower()
-    distributor_keywords = ["venta", "renta", "distribuidor", "reventa", "distribucion", "distribución"]
-    for keyword in distributor_keywords:
-        if keyword in g:
-            return True
-    return False
+
+    g = _normalizar_respuesta_corta(giro)
+    if not g:
+        return False
+
+    if any(palabra in g for palabra in _GIRO_DISTRIBUIDOR_FUERTE):
+        return True
+
+    match = _OBJETO_DE_LA_ACTIVIDAD_RE.search(g)
+    if match:
+        # El lead dijo explícitamente qué vende o renta: decide el objeto.
+        return _es_objeto_de_maquinaria(match.group("objeto"))
+
+    # Sin objeto explícito, solo las actividades inequívocas cuentan.
+    return any(palabra in g for palabra in _GIRO_ACTIVIDAD_COMERCIAL)
+
+
+# Muletillas, confirmaciones y evasivas que NO describen la actividad de una
+# empresa. El lead contesta "Claro" a "¿me compartes el giro?" queriendo decir
+# "sí, ahorita te lo doy", y tanto el extractor del LLM como la inferencia por
+# contexto de la pregunta lo guardaban tal cual: se vio en producción un lead
+# con giro_empresa="Claro".
+#
+# No es solo un dato feo. `giro_empresa` se escribe en Odoo y además ALIMENTA UNA
+# DECISIÓN DE NEGOCIO: la reclasificación distribuidor → cliente_final consulta
+# `_is_distribuidor(giro)`, así que una muletilla guardada como giro cambia la
+# clasificación comercial del lead.
+_RESPUESTAS_QUE_NO_SON_GIRO = {
+    # Confirmaciones
+    "si", "s", "sip", "claro", "claro que si", "por supuesto", "ok", "okay",
+    "oka", "va", "vale", "sale", "dale", "listo", "correcto", "exacto",
+    "asi es", "de acuerdo", "entendido", "enterado", "perfecto", "excelente",
+    "bueno", "buena", "aja", "ajam", "va que va",
+    # Negaciones y evasivas
+    "no", "nop", "nel", "no se", "no lo se", "no sabria", "no sabria decirte",
+    "ninguno", "ninguna", "nada", "na", "n/a", "cualquiera", "lo que sea",
+    "despues te digo", "luego te digo", "al rato", "ahorita no",
+    # Cortesías y saludos
+    "gracias", "muchas gracias", "hola", "buenas", "buen dia", "buenos dias",
+    "buenas tardes", "buenas noches", "gusto en saludarte",
+}
+
+
+def _normalizar_respuesta_corta(value: str) -> str:
+    """Minúsculas, sin acentos y sin puntuación de orilla, para comparar contra el set."""
+    sin_acentos = "".join(
+        c for c in unicodedata.normalize("NFKD", value) if not unicodedata.combining(c)
+    )
+    return re.sub(r"\s+", " ", sin_acentos.lower().strip(" .,;:!¡?¿\"'()")).strip()
 
 
 def _is_valid_business_activity(value: Any) -> bool:
-    """Descarta datos de contacto que el extractor confunda con el giro."""
+    """
+    Descarta lo que el extractor confunda con el giro de la empresa.
+
+    Rechaza datos de contacto (correos, URLs), respuestas que no describen una
+    actividad ("Claro", "Si", "no sé") y valores sin una sola letra ("123").
+
+    NO rechaza el centinela "No especificado": ese valor lo produce
+    `detect_negative_response` cuando el lead se niega a dar el dato, y es lo
+    único que destraba el flujo — sin él, `get_pending_empresa_fields` seguiría
+    pidiendo el giro para siempre. Lo que sí hace es que ese centinela no se
+    use para tomar decisiones de negocio (ver la reclasificación de tipo_cliente).
+    """
     if not isinstance(value, str):
         return False
 
@@ -201,7 +416,74 @@ def _is_valid_business_activity(value: Any) -> bool:
         return False
     if re.search(r"(?:https?://|www\.)", activity, re.IGNORECASE):
         return False
+
+    normalizado = _normalizar_respuesta_corta(activity)
+    if not normalizado:
+        return False
+    if normalizado in _RESPUESTAS_QUE_NO_SON_GIRO:
+        return False
+    # Un giro siempre tiene letras: "123", "55 1234 5678" o "---" no lo son.
+    if not re.search(r"[a-z]", normalizado):
+        return False
     return True
+
+
+# Negarse a dar el dato no se puede enumerar en una lista: "prefiero no decirlo",
+# "no te lo puedo compartir", "es confidencial", "¿para qué lo necesitas?". Se
+# detecta la FORMA de la negativa (negación pegada a un verbo de decir/dar), la
+# misma técnica que se usa para las refacciones.
+_VERBOS_DE_DECIR = r"(?:dec\w*|dar\w*|doy|compartir\w*|proporcionar\w*|responder\w*|contestar\w*|mencionar\w*|inform\w*)"
+_NEGATIVA_A_RESPONDER_RE = re.compile(
+    r"\bprefiero\s+no\b"
+    rf"|\bno\s+(?:te\s+|le\s+|se\s+|lo\s+)*(?:puedo|quiero|deseo|voy\s+a|pienso)\s+(?:te\s+|lo\s+)?{_VERBOS_DE_DECIR}"
+    rf"|\bno\s+(?:te\s+|lo\s+)?{_VERBOS_DE_DECIR}"
+    r"|\bconfidencial\b"
+    r"|\bsin\s+comentarios\b"
+    r"|\bpara\s+que\s+(?:lo\s+)?(?:quieres|necesitas|sirve)\b"
+    r"|\bno\s+(?:lo\s+)?(?:se|sabria)\b"
+)
+
+
+def _es_negativa_a_responder(value: Optional[str]) -> bool:
+    """True si el lead se está negando a dar el dato en vez de dándolo."""
+    if not value:
+        return False
+    return bool(_NEGATIVA_A_RESPONDER_RE.search(_normalizar_respuesta_corta(value)))
+
+
+def _normalizar_giro_empresa(value: Any) -> Optional[str]:
+    """
+    Decide QUÉ guardar como giro: el texto, el centinela, o nada.
+
+    Tres resultados distintos, y la diferencia importa:
+      - texto        → el lead sí describió su actividad.
+      - "No especificado" → el lead se NEGÓ a decirlo. Hay que guardar algo o
+        `get_pending_empresa_fields` sigue pidiendo el giro para siempre, pero
+        ese algo no debe ser la frase con la que se negó ("prefiero no decirlo"
+        no es un giro, y encima acabaría en Odoo y en la reclasificación de
+        tipo_cliente).
+      - None         → no hay dato utilizable; se vuelve a preguntar.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    if _es_negativa_a_responder(value):
+        return "No especificado"
+    if not _is_valid_business_activity(value):
+        return None
+    return value.strip()
+
+
+def _giro_es_informativo(giro: Optional[str]) -> bool:
+    """
+    True si el giro sirve para decidir algo, no solo para destrabar el flujo.
+
+    "No especificado" se guarda a propósito cuando el lead no quiere dar el dato,
+    pero NO es evidencia de nada: tratarlo como "no es distribuidor" reclasificaba
+    a cliente_final a un lead que nunca contestó.
+    """
+    if not giro:
+        return False
+    return _normalizar_respuesta_corta(giro) not in ("no especificado", "no tiene")
 
 
 _MEASUREMENT_UNIT_PATTERNS = {
@@ -419,11 +701,17 @@ def _sanitize_extracted_info(
         sanitized["tipo_cliente"] = "cliente_final"
 
     giro = sanitized.get("giro_empresa")
-    if giro is not None and not _is_valid_business_activity(giro):
-        sanitized.pop("giro_empresa")
-        logging.warning(
-            "Descartado giro_empresa: contiene datos de contacto o no describe una actividad."
-        )
+    if giro is not None:
+        giro_normalizado = _normalizar_giro_empresa(giro)
+        if giro_normalizado is None:
+            sanitized.pop("giro_empresa")
+            logging.warning(
+                "Descartado giro_empresa %r: contiene datos de contacto o no describe una actividad.",
+                giro,
+            )
+        elif giro_normalizado != giro:
+            sanitized["giro_empresa"] = giro_normalizado
+            logging.info("giro_empresa %r es una negativa a responder; se guarda el centinela.", giro)
     if message is not None:
         _discard_values_with_incompatible_units(
             sanitized,
@@ -718,23 +1006,39 @@ class IntelligentSlotFiller:
             # Obtener campos disponibles desde el FIELDS_CONFIG_PRIORITY
             fields_available = self._get_fields_available_str()
 
-            # Obtener campos específicos del tipo de maquinaria actual
+            # Campos específicos de los tipos de maquinaria EN JUEGO: el que ya
+            # está en el estado y, sobre todo, cualquiera que el lead nombre en
+            # ESTE mensaje.
+            #
+            # El prompt es estricto ("NO extraigas campos que no estén en esta
+            # lista"), así que declarar solo los del tipo anterior le PROHIBÍA al
+            # extractor emitir los detalles del tipo nuevo. Un lead que cambia de
+            # máquina a media conversación da el tipo y su detalle en la misma
+            # frase —"y también una plataforma de 10 metros de altura"— con el
+            # estado todavía en "generador": `altura_trabajo_m` no estaba
+            # permitido, el 10 se perdía, y el bot se quedaba pidiendo la altura
+            # que el lead ya había dado (6 veces seguidas en el Flujo 9).
             machine_type = current_state.get("tipo_maquinaria")
-            machine_specific_fields = ""
-            
+            tipos_en_juego: List[str] = []
             if machine_type:
-                # Validar dinámicamente si existe configuración
-                config = machinery_config_service.get_config(machine_type)
-                if config:
-                   field_instructions = []
-                   for field in config.fields:
-                       unit_instruction = f", unidad obligatoria: {field.unit}" if field.unit else ""
-                       field_instructions.append(
-                           f"- Para {machine_type.upper()}: {field.name} "
-                           f"({field.question}{unit_instruction})"
-                       )
-                   machine_specific_fields = "\n".join(field_instructions)
-            
+                tipos_en_juego.append(machine_type)
+            for tipo_mencionado in machinery_config_service.resolve_type_ids(message):
+                if tipo_mencionado not in tipos_en_juego:
+                    tipos_en_juego.append(tipo_mencionado)
+
+            field_instructions = []
+            for tipo in tipos_en_juego:
+                config = machinery_config_service.get_config(tipo)
+                if not config:
+                    continue
+                for field in config.fields:
+                    unit_instruction = f", unidad obligatoria: {field.unit}" if field.unit else ""
+                    field_instructions.append(
+                        f"- Para {tipo.upper()}: {field.name} "
+                        f"({field.question}{unit_instruction})"
+                    )
+            machine_specific_fields = "\n".join(field_instructions)
+
             if not machine_specific_fields:
                 machine_specific_fields = "- No hay un tipo de maquinaria seleccionado aún, o no hay configuración específica."
 
@@ -1649,6 +1953,9 @@ class IntelligentLeadQualificationChatbot:
             "maquinas_recomendadas": [],  # Lista de máquinas recomendadas para mapear posición a modelo
             "maquina_mencionada": None,  # Código/modelo que el lead mencionó por su cuenta
             "modelo_verificado_inventario": False,
+            "tipos_maquinaria_mencionados": [],  # Todos los tipos que nombró el lead, en orden
+            "intentos_tipo_maquinaria": 0,  # Veces que se preguntó el tipo sin lograr resolverlo
+            "solicita_refacciones": False,  # El lead pidió una refacción, no una máquina
             "marcas_solicitadas": [],  # Marcas que pidió el lead (ej. ["DeWalt", "Makita"])
             "marcas_aclaradas": False,  # True cuando el bot ya le respondió sobre esas marcas
             "cobertura_aclarada": False  # True cuando ya se le dijo que solo operamos en México
@@ -1707,6 +2014,13 @@ class IntelligentLeadQualificationChatbot:
         Retorna un mensaje diferente si el usuario necesita algo diferente a maquinaria.
         """
         tipo_ayuda = self.state.get("tipo_ayuda")
+        if self.state.get("solicita_refacciones"):
+            # No prometemos "te comparto la información": el bot no consulta el
+            # catálogo de refacciones y no puede confirmar disponibilidad.
+            return (
+                "Sobre la refacción que necesitas, un asesor especializado se pondrá "
+                "en contacto contigo para confirmarte disponibilidad y precio."
+            )
         if tipo_ayuda == "otro":
             return "Claro, en un momento te comparto la información."
         else:
@@ -1751,6 +2065,10 @@ class IntelligentLeadQualificationChatbot:
                 self.state,
             )
             debug_print(f"DEBUG: Información extraída: {extracted_info}")
+
+            # Encaminar las peticiones de refacciones ANTES de mirar la máquina:
+            # el modelo que menciona el lead identifica la pieza, no una venta.
+            self._detect_refacciones_request(user_message, extracted_info)
 
             # Detectar si el lead mencionó el código/modelo de una máquina. Se hace
             # ANTES de actualizar Odoo y el estado para que el tipo de maquinaria
@@ -1803,6 +2121,137 @@ class IntelligentLeadQualificationChatbot:
         msg_lower = message.lower()
         return any(kw in msg_lower for kw in keywords)
 
+    def _detect_refacciones_request(self, user_message: str, extracted_info: Dict[str, Any]) -> None:
+        """
+        Encamina a un asesor al lead que pide una refacción, no una máquina.
+
+        El lead que escribe "busco refacción para mi Simpedil C54 EVO" menciona
+        el modelo para identificar la PIEZA, no porque quiera comprar la
+        cortadora. Antes eso se leía como interés en la máquina: se llenaba
+        `tipo_maquinaria`, de ahí se infería `tipo_ayuda="maquinaria"` y arrancaba
+        el flujo completo de cotización. El lead terminaba recibiendo la
+        recomendación de una máquina que ya tiene y la petición de su Constancia
+        de Situación Fiscal, mientras repetía que solo quería una refacción.
+
+        `tipo_ayuda="otro"` es la rama correcta: no se cotiza ni se manda PDF, se
+        deriva a un asesor que continúa la conversación.
+
+        Solo aplica si el `tipo_ayuda` todavía no está definido. Un lead que ya
+        venía calificando una máquina y de paso menciona refacciones no debe
+        perder ese flujo.
+        """
+        intencion = _clasificar_intencion_refaccion(user_message)
+
+        if intencion == "maquina":
+            # El lead descarta la refacción y pide la máquina. Si veníamos
+            # encaminados a refacciones hay que devolverlo al flujo de cotización.
+            self._reclasificar_a_maquinaria()
+            return
+
+        if intencion != "refaccion":
+            # "indefinido": evidencia contradictoria o inexistente. Lo resuelve
+            # la extracción del LLM, que sí lee el contexto de la frase.
+            return
+
+        self.state["solicita_refacciones"] = True
+
+        if self.state.get("tipo_ayuda") not in (None, "", "otro"):
+            debug_print(
+                "DEBUG: Se mencionaron refacciones pero el flujo ya es "
+                f"tipo_ayuda='{self.state.get('tipo_ayuda')}'; no se redirige."
+            )
+            return
+
+        extracted_info["tipo_ayuda"] = "otro"
+        # El modelo mencionado identifica la refacción; no es una máquina a cotizar.
+        for campo in ("tipo_maquinaria", "quiere_cotizacion", "maquina_seleccionada"):
+            extracted_info.pop(campo, None)
+        debug_print("DEBUG: Solicitud de refacciones detectada; tipo_ayuda='otro' (derivación a asesor)")
+
+    def _reclasificar_a_maquinaria(self) -> None:
+        """
+        Devuelve al flujo de cotización a un lead mal encaminado a refacciones.
+
+        Ningún clasificador acierta siempre, así que lo importante no es no
+        equivocarse: es que el error se pueda deshacer. Sin esto, un lead que
+        cayera en `tipo_ayuda="otro"` quedaba atrapado — el campo no se puede
+        sobrescribir (ver la lista de excepciones en
+        `_update_state_with_extracted_info`), `is_conversation_complete` da True
+        con solo nombre y apellido, y `cotizacion_enviada` manda el resto de la
+        conversación a la rama del LLM libre. Decir "no, quiero comprar la
+        máquina" no lo sacaba de ahí.
+        """
+        if not self.state.get("solicita_refacciones") and self.state.get("tipo_ayuda") != "otro":
+            return
+
+        debug_print("DEBUG: El lead descarta la refacción y pide la máquina; se reabre el flujo de cotización.")
+        self.state["solicita_refacciones"] = False
+        self.state["tipo_ayuda"] = "maquinaria"
+        self.state["completed"] = False
+        self.state["cotizacion_enviada"] = False
+        self.state["cierre_ofrecido"] = False
+
+    def _es_solicitud_de_refacciones(self, extracted_info: Dict[str, Any]) -> bool:
+        """True si el turno actual quedó encaminado como petición de refacciones."""
+        return (
+            extracted_info.get("tipo_ayuda") == "otro"
+            and bool(self.state.get("solicita_refacciones"))
+        )
+
+    def _registrar_tipos_mencionados(self, tipos: List[str]) -> None:
+        """
+        Deja constancia de TODOS los tipos que nombró el lead, en orden.
+
+        El estado solo puede sostener un `tipo_maquinaria` a la vez, pero un lead
+        que pide "10 generadores y 4 torres de iluminación" mencionó dos. Sin
+        esto, la segunda máquina desaparecía del lead y ni el asesor ni el CRM se
+        enteraban de que existía.
+        """
+        if not tipos:
+            return
+        registrados = self.state.get("tipos_maquinaria_mencionados") or []
+        for tipo in tipos:
+            if tipo not in registrados:
+                registrados.append(tipo)
+        self.state["tipos_maquinaria_mencionados"] = registrados
+
+    def _sembrar_tipo_maquinaria(self, extracted_info: Dict[str, Any], categoria: str) -> None:
+        """
+        Inyecta `tipo_maquinaria` en la extracción cuando el LLM no lo trajo.
+
+        Se escribe en `extracted_info` y no en el estado directo para que pase
+        por las validaciones de `_update_state_with_extracted_info` y para que el
+        dato llegue también a Odoo.
+        """
+        if not categoria:
+            return
+        if extracted_info.get("tipo_maquinaria") or self.state.get("tipo_maquinaria"):
+            return
+        # Si el lead pide una refacción, el tipo que nombró describe la máquina
+        # que YA tiene. Sembrarlo reactivaría el flujo de cotización del que
+        # _detect_refacciones_request acaba de sacarlo.
+        if extracted_info.get("tipo_ayuda") == "otro" or self.state.get("solicita_refacciones"):
+            return
+        extracted_info["tipo_maquinaria"] = categoria
+        debug_print(f"DEBUG: tipo_maquinaria='{categoria}' resuelto de forma determinista del mensaje del lead")
+
+    def _categoria_del_modelo(self, modelo: Any) -> Optional[str]:
+        """Categoría del modelo según el inventario, o None si no se reconoce."""
+        if not isinstance(modelo, str) or not modelo.strip():
+            return None
+        ref = detect_machine_reference(modelo)
+        return ref.categoria if ref and ref.categoria else None
+
+    def _categoria_por_familia_del_codigo(self, code_candidate: str) -> str:
+        """
+        Categoría que revela el prefijo del código, aunque no tengamos ese modelo.
+
+        Se consulta el código AISLADO (no el mensaje completo) para que el
+        veredicto venga del código que ya se identificó y no de otro token.
+        """
+        ref = detect_machine_reference(code_candidate)
+        return ref.categoria if ref else ""
+
     def _detect_and_merge_machine_reference(
         self, user_message: str, extracted_info: Dict[str, Any]
     ) -> Optional[MachineReference]:
@@ -1815,9 +2264,23 @@ class IntelligentLeadQualificationChatbot:
         respuesta pueda reconocerla antes de re-preguntar el dato pendiente.
         """
         self._model_lookup_status = None
+
+        # Tipos que el lead nombró en LENGUAJE NATURAL ("generadores portátiles",
+        # "torres de iluminación"). Es una vía determinista, independiente del
+        # LLM: cuando el mensaje trae varias máquinas o un código de modelo que
+        # distrae, la extracción del LLM se queda sin `tipo_maquinaria` y el bot
+        # se atoraba preguntando el tipo una y otra vez.
+        tipos_en_texto = machinery_config_service.resolve_type_ids(user_message)
+        self._registrar_tipos_mencionados(tipos_en_texto)
+
         code_candidate = extract_machine_code_candidate(user_message)
         if code_candidate:
-            brand_mentions = detect_brand_mentions(user_message)
+            # La marca se busca SOLO en el tramo donde está el código. Buscarla en
+            # todo el mensaje mezclaba máquinas distintas: con "-10 Generadores
+            # GV-8000S / -4 Torres Trime X-Start" el bot armaba "Trime GV-8000S"
+            # y negaba un modelo que el lead nunca pidió.
+            segmento_codigo = segment_containing_code(user_message, code_candidate)
+            brand_mentions = detect_brand_mentions(segmento_codigo)
             requested_model = (
                 f"{brand_mentions[0]} {code_candidate}"
                 if brand_mentions else code_candidate
@@ -1827,10 +2290,15 @@ class IntelligentLeadQualificationChatbot:
             self._model_lookup_status = lookup.status
 
             if lookup.status == "found" and lookup.model and lookup.category:
-                extracted_info["tipo_ayuda"] = "maquinaria"
-                extracted_info["tipo_maquinaria"] = lookup.category
-                extracted_info["maquina_seleccionada"] = lookup.model
-                extracted_info["quiere_cotizacion"] = True
+                # Con una solicitud de refacciones el modelo SÍ existe en el
+                # inventario, pero es la máquina que el lead ya tiene: no es una
+                # venta que cotizar. Se conserva la referencia (sirve para
+                # nombrar la máquina de la refacción) sin tocar el flujo.
+                if not self._es_solicitud_de_refacciones(extracted_info):
+                    extracted_info["tipo_ayuda"] = "maquinaria"
+                    extracted_info["tipo_maquinaria"] = lookup.category
+                    extracted_info["maquina_seleccionada"] = lookup.model
+                    extracted_info["quiere_cotizacion"] = True
                 return MachineReference(
                     texto=requested_model,
                     categoria=lookup.category,
@@ -1840,11 +2308,21 @@ class IntelligentLeadQualificationChatbot:
                 )
 
             if lookup.status == "not_found":
+                # Que NO tengamos ese modelo exacto no significa que no sepamos
+                # de qué tipo de máquina habla el lead. Antes se devolvía
+                # categoria="" y el flujo se quedaba sin tipo_maquinaria: el bot
+                # decía "no contamos con ese modelo" y volvía a preguntar el tipo
+                # que el lead ya había escrito, en bucle.
                 categoria = (
                     extracted_info.get("tipo_maquinaria")
                     or self.state.get("tipo_maquinaria")
+                    or machinery_config_service.resolve_type_id(segmento_codigo)
+                    or self._categoria_por_familia_del_codigo(code_candidate)
+                    or (tipos_en_texto[0] if tipos_en_texto else "")
                     or ""
                 )
+                if categoria:
+                    self._sembrar_tipo_maquinaria(extracted_info, categoria)
                 return MachineReference(
                     texto=requested_model,
                     categoria=categoria,
@@ -1859,10 +2337,15 @@ class IntelligentLeadQualificationChatbot:
                     requested_model,
                     lookup.status,
                 )
+                # Cosmos no concluyó, pero el texto del lead sí dice el tipo.
+                if tipos_en_texto:
+                    self._sembrar_tipo_maquinaria(extracted_info, tipos_en_texto[0])
                 return None
 
         ref = detect_machine_reference(user_message)
         if not ref:
+            if tipos_en_texto:
+                self._sembrar_tipo_maquinaria(extracted_info, tipos_en_texto[0])
             return None
 
         debug_print(f"DEBUG: Referencia a máquina detectada: {ref}")
@@ -1891,6 +2374,8 @@ class IntelligentLeadQualificationChatbot:
             return
 
         if self._model_lookup_status == "found" and self._machine_ref.modelo:
+            if self.state.get("solicita_refacciones"):
+                return
             self.state["tipo_ayuda"] = "maquinaria"
             self.state["tipo_maquinaria"] = self._machine_ref.categoria
             self.state["maquina_seleccionada"] = self._machine_ref.modelo
@@ -2088,6 +2573,27 @@ class IntelligentLeadQualificationChatbot:
 
             return result
 
+        # Guardia anti-bucle: si ya preguntamos el tipo de maquinaria varias veces
+        # y seguimos sin poder resolverlo, dejar de repetir la pregunta genérica y
+        # enseñarle al lead la lista literal de tipos que manejamos.
+        if next_question_type == "tipo_maquinaria" and next_question_str:
+            intentos = self.state.get("intentos_tipo_maquinaria", 0)
+            if intentos >= _MAX_PREGUNTAS_TIPO_MAQUINARIA:
+                debug_print(
+                    f"DEBUG: {intentos} intentos sin resolver tipo_maquinaria; "
+                    "se responde con el catálogo de tipos en vez de repetir la pregunta."
+                )
+                prefijo = ""
+                if self._machine_ref and self._model_lookup_status == "not_found":
+                    prefijo = (
+                        f"No contamos con el modelo {self._machine_ref.texto} "
+                        "en nuestro inventario. "
+                    )
+                return self._add_message_and_return_response(
+                    prefijo + _build_catalog_response(next_question_str),
+                    storage_question_type,
+                )
+
         # La disponibilidad de un modelo exacto viene de Cosmos y se comunica de
         # forma determinista para que el LLM no la omita ni la contradiga.
         if self._machine_ref and next_question_str:
@@ -2149,6 +2655,11 @@ class IntelligentLeadQualificationChatbot:
             debug_print(f"DEBUG: Error enviando mensaje por WhatsApp: {e}")
             # Continuar sin el ID si hay error
         
+        # Contador de reintentos de la pregunta de tipo de maquinaria (guardia
+        # anti-bucle; ver _MAX_PREGUNTAS_TIPO_MAQUINARIA).
+        if question_type == "tipo_maquinaria":
+            self.state["intentos_tipo_maquinaria"] = self.state.get("intentos_tipo_maquinaria", 0) + 1
+
         # Crear el mensaje con el ID de WhatsApp       
         self.state["messages"].append({
             "role": "assistant", 
@@ -2398,6 +2909,16 @@ class IntelligentLeadQualificationChatbot:
                 # para cuando este nuevo requerimiento termine.
                 self.state["cierre_ofrecido"] = False
 
+                # Un lead cerrado como refacciones que ahora pide una máquina
+                # concreta vuelve al flujo de cotización. Sin esto, reabrir no
+                # servía de nada: `tipo_ayuda` seguía en "otro" y
+                # `is_conversation_complete` volvía a cerrar la conversación en
+                # el mismo turno con solo nombre y apellido. Se exige un
+                # `tipo_maquinaria` real y no un simple `quiere_cotizacion=True`,
+                # que puede venir de un "sí" a cualquier otra pregunta.
+                if new_tipo and self.state.get("tipo_ayuda") == "otro":
+                    self._reclasificar_a_maquinaria()
+
         # Si el usuario CAMBIA un detalle de la maquinaria DESPUÉS de que ya se
         # recomendaron opciones (ej: pasa de 300A a 185A), los requerimientos
         # cambiaron y la recomendación previa quedó obsoleta. Invalida la
@@ -2447,7 +2968,7 @@ class IntelligentLeadQualificationChatbot:
                 del extracted_info["giro_empresa"]
                 debug_print(f"DEBUG: Eliminado giro_empresa='{giro_value}' de extracción simultánea con tipo_cliente='distribuidor'. El giro se preguntará por separado.")
 
-        for key, value in extracted_info.items():
+        for key, value in sorted(extracted_info.items(), key=_orden_de_aplicacion):
             # 1. Ignorar valores nulos o vacíos para no insertar datos inútiles.
             if value is None or value == "":
                 continue
@@ -2473,7 +2994,7 @@ class IntelligentLeadQualificationChatbot:
             # Esto es clave para evitar que una respuesta ambigua posterior
             # borre un dato que ya se había confirmado.
             current_value = self.state.get(key)
-            if key not in ["detalles_maquinaria", "quiere_cotizacion", "maquina_seleccionada", "tipo_maquinaria", "giro_empresa", "tipo_cliente"] and current_value:
+            if key not in ["detalles_maquinaria", "quiere_cotizacion", "maquina_seleccionada", "tipo_maquinaria", "tipo_ayuda", "giro_empresa", "tipo_cliente"] and current_value:
                 debug_print(f"DEBUG: Campo '{key}' ya tiene valor válido '{current_value}', no se sobrescribe.")
                 continue
 
@@ -2505,12 +3026,46 @@ class IntelligentLeadQualificationChatbot:
                 self.state["detalles_maquinaria"] = current_detalles
                 debug_print(f"DEBUG: Detalles de maquinaria actualizados: {self.state['detalles_maquinaria']}")
             
+            elif key == "tipo_ayuda":
+                # `tipo_ayuda` se dejó de bloquear para permitir UNA sola
+                # transición: "otro" → "maquinaria". Es la red de seguridad para
+                # cuando el clasificador determinista no se pronunció
+                # ("indefinido") y fue el LLM quien detectó que el lead sí quiere
+                # comprar la máquina. Cualquier otra reescritura sigue prohibida:
+                # un lead ya calificado como "maquinaria" no debe caer a "otro"
+                # por una frase suelta.
+                tipo_ayuda_actual = self.state.get("tipo_ayuda")
+                if not tipo_ayuda_actual:
+                    self.state[key] = value
+                    debug_print(f"DEBUG: Campo '{key}' actualizado con valor: '{value}'")
+                elif tipo_ayuda_actual == "otro" and value == "maquinaria":
+                    debug_print("DEBUG: El LLM reclasificó tipo_ayuda 'otro' → 'maquinaria'.")
+                    self._reclasificar_a_maquinaria()
+                else:
+                    debug_print(
+                        f"DEBUG: Transición de tipo_ayuda '{tipo_ayuda_actual}' → '{value}' "
+                        "no permitida; se conserva el valor actual."
+                    )
+
             elif key == "tipo_maquinaria":
                 # Validar dinámicamente si el tipo existe en la configuración
                 config = machinery_config_service.get_config(value)
+                if not config:
+                    # El LLM suele devolver el tipo como lo dijo el lead
+                    # ("generadores", "torre de iluminación", "planta de luz") en
+                    # vez del type_id. Antes eso se descartaba en silencio:
+                    # tipo_maquinaria se quedaba en None y el bot repetía la
+                    # misma pregunta en cada turno. Se intenta normalizar contra
+                    # el vocabulario del catálogo ANTES de tirar el valor.
+                    normalizado = machinery_config_service.resolve_type_id(value)
+                    if normalizado:
+                        debug_print(f"DEBUG: tipo_maquinaria '{value}' normalizado a '{normalizado}'")
+                        value = normalizado
+                        config = machinery_config_service.get_config(value)
                 if config:
                     old_tipo = self.state.get("tipo_maquinaria")
                     self.state[key] = value
+                    self.state["intentos_tipo_maquinaria"] = 0
                     debug_print(f"DEBUG: Campo '{key}' actualizado a: {value}")
                     
                     # Si el tipo de maquinaria CAMBIÓ, limpiar campos relacionados
@@ -2523,8 +3078,35 @@ class IntelligentLeadQualificationChatbot:
                         self.state["modelo_verificado_inventario"] = False
                         self.state["completed"] = False
                 else:
-                    logging.error(f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM.")
+                    logging.error(
+                        f"ADVERTENCIA: Tipo de maquinaria inválido '{value}' extraído por el LLM "
+                        "y no reconocible en el catálogo; se descarta."
+                    )
             
+            elif key == "maquina_seleccionada":
+                # La máquina elegida tiene que ser del tipo que se está
+                # cotizando. Cuando el lead cambia de máquina a media
+                # conversación ("y también una plataforma de 10 metros"), el
+                # extractor suele leer ese mensaje como que además ACEPTA la
+                # recomendación anterior y devuelve el modelo viejo; como
+                # `tipo_maquinaria` se aplica primero, su limpieza ya corrió y
+                # el modelo viejo se colaba, dejando seleccionado un generador
+                # en una cotización de plataforma.
+                #
+                # Solo se descarta ante una discrepancia POSITIVA: un valor
+                # parcial que aún no resuelve a ningún modelo ("la segunda")
+                # pasa y lo resuelve el bloque de nombres parciales de más abajo.
+                tipo_actual = self.state.get("tipo_maquinaria")
+                categoria = self._categoria_del_modelo(value)
+                if tipo_actual and categoria and categoria != tipo_actual:
+                    logging.warning(
+                        "Descartada maquina_seleccionada '%s': es de '%s' y la cotización "
+                        "actual es de '%s'.", value, categoria, tipo_actual
+                    )
+                    continue
+                self.state[key] = value
+                debug_print(f"DEBUG: Campo '{key}' actualizado con valor: '{value}'")
+
             elif key == "apellido":
                 # Combinar nombre y apellido en el campo nombre
                 nombre_actual = self.state.get("nombre", "")
@@ -2601,12 +3183,16 @@ class IntelligentLeadQualificationChatbot:
                     last_user_msg = user_messages[-1].get("content", "").strip()
                     # Si el lead contestó con el código de una máquina en vez del giro,
                     # NO tomarlo como giro: se re-preguntará y el bot reconocerá la máquina.
-                    if (last_user_msg
-                            and len(last_user_msg) < 100  # Respuesta razonable, no un párrafo largo
-                            and not looks_like_machine_code(last_user_msg)
-                            and _is_valid_business_activity(last_user_msg)):
-                        self.state["giro_empresa"] = last_user_msg
-                        debug_print(f"DEBUG: Inferido giro_empresa='{last_user_msg}' por contexto de pregunta sobre giro.")
+                    giro_inferido = (
+                        _normalizar_giro_empresa(last_user_msg)
+                        if last_user_msg
+                        and len(last_user_msg) < 100  # Respuesta razonable, no un párrafo largo
+                        and not looks_like_machine_code(last_user_msg)
+                        else None
+                    )
+                    if giro_inferido:
+                        self.state["giro_empresa"] = giro_inferido
+                        debug_print(f"DEBUG: Inferido giro_empresa='{giro_inferido}' por contexto de pregunta sobre giro.")
 
         # Reclasificar distribuidor → cliente_final cuando:
         # - El usuario dijo que se dedica a la venta/renta (tipo_cliente="distribuidor")
@@ -2614,9 +3200,13 @@ class IntelligentLeadQualificationChatbot:
         # - Y su giro de empresa NO es de distribución/venta/renta de maquinaria
         # En este caso, el usuario realmente es un cliente final que usa la maquinaria
         # para su propio negocio (ej: construcción), así que se le cotiza directamente.
+        # Se exige un giro INFORMATIVO: el centinela "No especificado" significa
+        # que el lead no quiso decirlo, y tomarlo como "su giro no es de
+        # distribución" reclasificaba a cliente_final a alguien que nunca
+        # contestó — cambiándole el precio al que tiene derecho.
         if (self.state.get("tipo_cliente") == "distribuidor"
             and (self.state.get("constancia_fiscal_entregada") == "No tiene" or self.state.get("constancia_fiscal_entregada") is False)
-            and self.state.get("giro_empresa")
+            and _giro_es_informativo(self.state.get("giro_empresa"))
             and not _is_distribuidor(self.state.get("giro_empresa"))):
             self.state["tipo_cliente"] = "cliente_final"
             debug_print(f"DEBUG: Reclasificado de distribuidor a cliente_final. Giro '{self.state.get('giro_empresa')}' no es de distribución y no tiene constancia fiscal.")

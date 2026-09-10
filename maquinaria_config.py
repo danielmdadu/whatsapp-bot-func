@@ -2,7 +2,9 @@
 Configuración centralizada de maquinaria
 """
 
-from typing import List, Dict, Any, Optional
+import re
+import unicodedata
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field
 
 # ============================================================================
@@ -47,6 +49,71 @@ TYPE_DISPLAY_NAMES: Dict[str, str] = {
 }
 
 # ============================================================================
+# VOCABULARIO EN LENGUAJE NATURAL → type_id
+#
+# El lead casi nunca escribe el type_id ("torre_iluminacion"): escribe
+# "Torres de Iluminación", "planta de luz", "martillo neumático". La extracción
+# del LLM normalmente lo traduce, pero cuando falla (mensajes con VARIAS
+# máquinas, o con un código de modelo que distrae) devolvía un valor inválido o
+# ninguno, `get_config()` lo rechazaba en silencio y `tipo_maquinaria` se
+# quedaba en None PARA SIEMPRE: el bot volvía a preguntar el tipo en cada turno.
+# Este vocabulario da un camino DETERMINISTA (sin LLM) para resolver el tipo.
+#
+# Solo son sinónimos que NO se deducen del type_id ni del display_name; esos dos
+# se agregan automáticamente al índice.
+# ============================================================================
+
+_TYPE_SYNONYMS: Dict[str, Tuple[str, ...]] = {
+    "soldadora": ("planta de soldar", "maquina de soldar", "equipo de soldar", "soldadura"),
+    "compresor": ("compresora", "compresor de aire"),
+    "rompedor": ("martillo neumatico", "martillo demoledor", "martillo rompedor",
+                 "rompedora", "martillo"),
+    "motobomba": ("bomba de agua", "bomba autocebante", "bomba para agua"),
+    "apisonador": ("apisonadora", "bailarina", "vibrocompactador", "compactadora",
+                   "compactador de suelo", "placa vibratoria"),
+    "generador": ("planta de luz", "planta electrica", "planta generadora",
+                  "planta de energia", "generador portatil", "generador electrico"),
+    # Sin "cortadora"/"dobladora" a secas: sin el complemento no identifican el
+    # tipo (una "cortadora de concreto" no es una cortadora de varilla).
+    "cortadora_varillas": ("cortadora de varilla", "cortadora de varillas",
+                           "cortadora de acero"),
+    "dobladora_varillas": ("dobladora de varilla", "dobladora de varillas",
+                           "dobladora de acero"),
+    "torre_iluminacion": ("torre de iluminacion", "torre de luz", "torre de luces",
+                          "torre iluminacion", "torre de alumbrado"),
+    "montacargas": ("monta cargas",),
+    "plataforma": ("plataforma de elevacion", "plataforma elevadora",
+                   "plataforma de tijera", "brazo articulado", "manlift",
+                   "man lift", "tijera elevadora", "elevador de personal"),
+    "manipulador": ("manipulador telescopico", "telehandler", "manipulador"),
+}
+
+
+def _normalize_type_text(text: Optional[str]) -> str:
+    """
+    Minúsculas, sin acentos, sin puntuación y en singular aproximado.
+
+    La singularización es cruda a propósito (quita 'es'/'s' final) porque se
+    aplica IGUAL a los dos lados de la comparación: "Generadores Portátiles" y
+    "generador portatil" colapsan al mismo texto sin necesitar un lematizador.
+    """
+    if not text:
+        return ""
+    sin_acentos = "".join(
+        c for c in unicodedata.normalize("NFKD", str(text)) if not unicodedata.combining(c)
+    )
+    limpio = re.sub(r"[^a-z0-9]+", " ", sin_acentos.lower()).strip()
+    palabras = []
+    for palabra in limpio.split():
+        if len(palabra) > 4 and palabra.endswith("es"):
+            palabra = palabra[:-2]
+        elif len(palabra) > 3 and palabra.endswith("s"):
+            palabra = palabra[:-1]
+        palabras.append(palabra)
+    return " ".join(palabras)
+
+
+# ============================================================================
 # SERVICIO DE CONFIGURACIÓN
 # ============================================================================
 
@@ -58,6 +125,8 @@ class MachineryConfigService:
     
     def __init__(self, cosmos_client=None, database_name=None):
         self._configs: Dict[str, MachineryTypeSchema] = {}
+        self._vocab_signature: Optional[Tuple[str, ...]] = None
+        self._vocab_cache: List[Tuple[str, str]] = []
         if cosmos_client and database_name:
             self._db = cosmos_client.get_database_client(database_name)
             self._container = self._db.get_container_client("machinery_configuration")
@@ -134,6 +203,84 @@ class MachineryConfigService:
     def get_type_display_list(self) -> List[str]:
         """Lista de nombres amigables de TODOS los tipos manejados (en el orden del config)."""
         return [self.get_type_display_name(t.type_id) for t in self.get_all_types()]
+
+    def _get_type_vocabulary(self) -> List[Tuple[str, str]]:
+        """
+        Índice (frase_normalizada, type_id) ordenado de la frase más larga a la
+        más corta, para que "torre de iluminacion" gane sobre "torre" y
+        "cortadora de varilla" sobre "cortadora".
+
+        Se reconstruye si cambió el set de tipos cargados (Cosmos puede llegar
+        después del arranque con la config local de respaldo).
+        """
+        firma = tuple(sorted(self._configs.keys()))
+        if getattr(self, "_vocab_signature", None) == firma:
+            return self._vocab_cache
+
+        frases: Dict[str, str] = {}
+
+        def registrar(texto: Optional[str], type_id: str) -> None:
+            clave = _normalize_type_text(texto)
+            # La primera frase registrada manda: los type_id y nombres del config
+            # tienen prioridad sobre los sinónimos, que se agregan al final.
+            if clave and clave not in frases:
+                frases[clave] = type_id
+
+        for type_id in self._configs:
+            registrar(type_id.replace("_", " "), type_id)
+            config = self._configs[type_id]
+            registrar(config.name, type_id)
+            registrar(getattr(config, "display_name", None), type_id)
+            registrar(TYPE_DISPLAY_NAMES.get(type_id), type_id)
+
+        for type_id, sinonimos in _TYPE_SYNONYMS.items():
+            # Un sinónimo de un tipo que no está cargado no sirve para nada.
+            if type_id not in self._configs:
+                continue
+            for sinonimo in sinonimos:
+                registrar(sinonimo, type_id)
+
+        vocab = sorted(frases.items(), key=lambda par: len(par[0]), reverse=True)
+        self._vocab_signature = firma
+        self._vocab_cache = vocab
+        return vocab
+
+    def resolve_type_ids(self, text: Optional[str]) -> List[str]:
+        """
+        type_ids mencionados en texto libre, en orden de aparición y sin repetir.
+
+        Determinista, sin LLM. "Requiero 10 Generadores Portátiles y 4 Torres de
+        Iluminación" → ["generador", "torre_iluminacion"].
+        """
+        normalizado = _normalize_type_text(text)
+        if not normalizado:
+            return []
+
+        # Se marcan los tramos ya consumidos para que una frase larga bloquee a
+        # las cortas que contiene ("torre de iluminacion" impide un match suelto
+        # de "torre" en la misma posición).
+        consumido = [False] * len(normalizado)
+        encontrados: List[Tuple[int, str]] = []
+
+        for frase, type_id in self._get_type_vocabulary():
+            for match in re.finditer(rf"(?<![a-z0-9]){re.escape(frase)}(?![a-z0-9])", normalizado):
+                inicio, fin = match.span()
+                if any(consumido[inicio:fin]):
+                    continue
+                for i in range(inicio, fin):
+                    consumido[i] = True
+                encontrados.append((inicio, type_id))
+
+        ordenados: List[str] = []
+        for _, type_id in sorted(encontrados):
+            if type_id not in ordenados:
+                ordenados.append(type_id)
+        return ordenados
+
+    def resolve_type_id(self, text: Optional[str]) -> Optional[str]:
+        """Primer type_id mencionado en el texto, o None si no se reconoce ninguno."""
+        type_ids = self.resolve_type_ids(text)
+        return type_ids[0] if type_ids else None
 
     def get_required_fields(self, type_id: str) -> List[str]:
         """Obtiene una lista de los nombres de campos obligatorios para un tipo de maquinaria"""

@@ -225,10 +225,14 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     REGLAS ESPECIALES PARA TIPO_AYUDA:
     - Si la última pregunta es "¿En qué te puedo ayudar?" o similar, analiza si el usuario menciona:
       * MAQUINARIA: Si menciona cualquier tipo de maquinaria (soldadora, compresor, generador, montacargas, etc.), o cualquier cosa relacionada con equipos/máquinas → tipo_ayuda: "maquinaria"
-      * OTRO: Si menciona refacciones (sin contexto de maquinaria), créditos, financiamiento, información general, servicios, o cualquier otra cosa que NO sea maquinaria → tipo_ayuda: "otro"
+      * OTRO: Si menciona refacciones, créditos, financiamiento, información general, servicios, o cualquier otra cosa que NO sea la compra/renta de una máquina → tipo_ayuda: "otro"
     - Ejemplos de MAQUINARIA: "necesito una soldadora", "quiero un compresor", "busco generadores", "equipos de construcción", "quiero una maquina pesada"
-    - Ejemplos de OTRO: "refacciones" (sin contexto), "créditos", "financiamiento", "servicios", "cotización de refacciones" (sin mencionar maquinaria específica)
-    - IMPORTANTE: Si el usuario menciona maquinaria específica o tipos de maquinaria, SIEMPRE es "maquinaria"
+    - Ejemplos de OTRO: "refacciones", "créditos", "financiamiento", "servicios", "cotización de refacciones"
+    - REFACCIONES (REGLA CRÍTICA): pedir una REFACCIÓN es SIEMPRE "otro", AUNQUE el mensaje nombre la máquina, la marca o el modelo. Quien pide una refacción YA TIENE la máquina y solo la nombra para identificar la pieza; NO la quiere comprar.
+      * "refacciones para mi compresor" → {{"tipo_ayuda": "otro"}}  (NO "maquinaria")
+      * "busco refaccion para Cortadora de varilla marca Simpedil modelo C54 EVO" → {{"tipo_ayuda": "otro"}}
+      * En estos casos NO extraigas tipo_maquinaria, ni detalles_maquinaria, ni maquina_seleccionada, ni quiere_cotizacion: no hay una máquina que cotizar.
+    - IMPORTANTE: Si el usuario menciona maquinaria específica o tipos de maquinaria PARA COMPRARLA O RENTARLA, es "maquinaria". Si la menciona para ubicar una refacción, es "otro".
     
     EJEMPLOS DE EXTRACCIÓN:
     - Mensaje: "soy Renato Fuentes" → {{"nombre": "Renato", "apellido": "Fuentes"}}
@@ -251,7 +255,7 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Necesito una soldadora" → {{"tipo_ayuda": "maquinaria"}}
     - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Quiero información sobre créditos" → {{"tipo_ayuda": "otro"}}
     - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Refacciones" → {{"tipo_ayuda": "otro"}}
-    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Refacciones para mi compresor" → {{"tipo_ayuda": "maquinaria"}}
+    - Última pregunta: "¿En qué te puedo ayudar?" + Mensaje: "Refacciones para mi compresor" → {{"tipo_ayuda": "otro"}}
 
     REGLAS PARA MENSAJES MIXTOS (POSITIVO + NEGATIVO):
     - Si el mensaje contiene información positiva (datos que SÍ tiene) y negativa (datos que NO tiene), extrae LA INFORMACIÓN POSITIVA.

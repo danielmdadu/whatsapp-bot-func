@@ -26,6 +26,30 @@ TIPO_PROSPECTO_MAP = {
 # Valores válidos del campo de selección "tipo_ayuda" en Odoo (coinciden 1:1 con el bot)
 TIPO_AYUDA_VALUES = {"maquinaria", "otro"}
 
+# Mapeo de tipo_maquinaria del bot a los tags de crm.tag confirmados por el
+# integrador (18 tags en Odoo, catalogados por nombre en MAYÚSCULAS).
+# Algunas categorías del bot son más generales que los tags de Odoo (que
+# distinguen subtipo: portátil/estacionario, tijera/articulada/unipersonal).
+# Como hoy no podemos leer ese subtipo de forma confiable desde
+# detalles_maquinaria, para esas categorías se mandan TODOS los tags
+# relacionados — es una aproximación a nivel de categoría, no una selección
+# precisa del subtipo. Afinar esto si el integrador puede dar el nombre de
+# campo exacto del subtipo en detalles_maquinaria.
+TIPO_MAQUINARIA_TAG_MAP = {
+    "soldadora": ["SOLDADORAS"],
+    "compresor": ["COMPRESORES PORTATILES", "COMPRESORES ELECTRICOS ESTACIONARIOS"],
+    "rompedor": ["MARTILLOS NEUMATICOS"],
+    "motobomba": ["MOTOBOMBAS"],
+    "apisonador": ["APISIONADORES"],
+    "generador": ["GENERADORES ELECTRICOS", "GENERADORES PORTATILES"],
+    "cortadora_varillas": ["CORTADORA DE VARILLA"],
+    "dobladora_varillas": ["DOBLADORA DE VARILLA"],
+    "torre_iluminacion": ["TORRES DE ILUMINACION"],
+    "montacargas": ["MONTACARGAS"],
+    "plataforma": ["PLATAFORMAS DE TIJERA", "PLATAFORMAS ARTICULADAS", "PLATAFORMAS UNIPERSONALES"],
+    "manipulador": ["MANIPULADORES"],
+}
+
 
 class OdooManager:
     def __init__(self, base_url: str, database: str, username: str, api_key: str):
@@ -37,6 +61,7 @@ class OdooManager:
 
         self.lead_id: Optional[int] = None
         self._states_cache: Optional[Dict[str, int]] = None
+        self._tags_cache: Optional[Dict[str, int]] = None
 
         self.uid = self._authenticate()
 
@@ -165,9 +190,10 @@ class OdooManager:
                         values["tipo_prospecto"] = TIPO_PROSPECTO_MAP[value]
 
                 elif key == "tipo_maquinaria":
-                    # Sin campo dedicado todavía en Odoo: se recalcula la nota completa
-                    # (tipo_maquinaria + marcas_solicitadas) y se sobrescribe description.
-                    values["description"] = self._build_extra_notes(state, extracted_info)
+                    tag_ids = self._resolve_tag_ids(value)
+                    if tag_ids:
+                        # Comando (6, 0, ids) de Odoo: reemplaza el set completo de tags.
+                        values["tag_ids"] = [(6, 0, tag_ids)]
 
                 elif key == "detalles_maquinaria" and isinstance(value, dict):
                     current_detalles = state.get("detalles_maquinaria", {})
@@ -180,7 +206,7 @@ class OdooManager:
                     values["modelo_especifico"] = value
 
                 elif key == "marcas_solicitadas" and isinstance(value, list):
-                    # Sin campo dedicado todavía en Odoo: mismo recálculo completo que tipo_maquinaria.
+                    # Sin campo dedicado todavía en Odoo: se manda como texto a description.
                     if value:
                         values["description"] = self._build_extra_notes(state, extracted_info)
 
@@ -252,23 +278,45 @@ class OdooManager:
 
     def _build_extra_notes(self, state: Dict, extracted_info: Dict) -> Optional[str]:
         """
-        Arma el texto de 'description' para los dos campos que todavía no tienen
-        campo dedicado en Odoo (tipo_maquinaria, marcas_solicitadas). Se recalcula
-        completo a partir del estado en cada llamada (no se acumula por delta),
-        así que sobrescribe cualquier nota manual que se haya escrito directamente
-        en Odoo para ese lead. Quitar esto en cuanto el integrador agregue campos
-        dedicados para tipo_maquinaria y marcas_solicitadas.
+        Arma el texto de 'description' para marcas_solicitadas, que todavía no
+        tiene campo dedicado en Odoo. Se recalcula completo a partir del estado
+        en cada llamada (no se acumula por delta), así que sobrescribe cualquier
+        nota manual que se haya escrito directamente en Odoo para ese lead.
+        Quitar esto en cuanto el integrador agregue un campo dedicado.
         """
-        tipo_maquinaria = extracted_info.get("tipo_maquinaria") or state.get("tipo_maquinaria")
         marcas = extracted_info.get("marcas_solicitadas") or state.get("marcas_solicitadas") or []
+        if not marcas:
+            return None
+        return f"Marcas solicitadas: {', '.join(marcas)}"
 
-        parts = []
-        if tipo_maquinaria:
-            parts.append(f"Tipo de maquinaria de interés: {tipo_maquinaria}")
-        if marcas:
-            parts.append(f"Marcas solicitadas: {', '.join(marcas)}")
+    def _resolve_tag_ids(self, tipo_maquinaria: str) -> List[int]:
+        """
+        Resuelve tipo_maquinaria del bot a uno o más tag_ids de crm.tag.
 
-        return " | ".join(parts) if parts else None
+        Para categorías que en Odoo están divididas por subtipo (compresor,
+        generador, plataforma) se mandan todos los tags de esa categoría, ver
+        TIPO_MAQUINARIA_TAG_MAP.
+        """
+        if not tipo_maquinaria:
+            return []
+
+        tag_names = TIPO_MAQUINARIA_TAG_MAP.get(str(tipo_maquinaria).lower())
+        if not tag_names:
+            logging.warning(f"No hay mapeo de tag de Odoo para tipo_maquinaria='{tipo_maquinaria}'")
+            return []
+
+        if self._tags_cache is None:
+            try:
+                tags = self._execute_kw("crm.tag", "search_read", [[]], {"fields": ["name"], "limit": 0})
+                self._tags_cache = {t["name"].strip().lower(): t["id"] for t in tags}
+            except Exception as e:
+                logging.error(f"Error obteniendo catálogo de tags de Odoo: {e}")
+                self._tags_cache = {}
+
+        ids = [self._tags_cache[name.lower()] for name in tag_names if name.lower() in self._tags_cache]
+        if not ids:
+            logging.warning(f"Ningún tag de Odoo encontrado para tipo_maquinaria='{tipo_maquinaria}' (esperados: {tag_names})")
+        return ids
 
     def _convert_detalles_to_text(self, detalles: Dict, tipo_maquinaria) -> str:
         """Convierte los detalles de maquinaria a texto legible usando las preguntas de MAQUINARIA_CONFIG."""
