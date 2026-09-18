@@ -74,10 +74,13 @@ jobs:
           remote-build: true
 
       - name: Comprobar que las funciones indexaron
-        if: ${{ secrets.PROD_HEALTHCHECK_URL != '' }}
         env:
           URL: ${{ secrets.PROD_HEALTHCHECK_URL }}
         run: |
+          if [ -z "$URL" ]; then
+            echo "⚠️  Sin secret PROD_HEALTHCHECK_URL: se omite la comprobación post-despliegue."
+            exit 0
+          fi
           # agent-message con {} debe responder 400 (Invalid JSON / Missing wa_id).
           # 404 = la Function App no indexó ninguna función (como el 10-sep-2026).
           for i in 1 2 3 4 5 6; do
