@@ -1,0 +1,91 @@
+# Verifica que el código importe y despliega a la Azure Function de producción.
+#
+# Secrets que necesita el repo (Settings > Secrets and variables > Actions):
+#   AZURE_FUNCTIONAPP_PUBLISH_PROFILE  contenido completo del archivo
+#                                      whatsappbot-func.PublishSettings (obligatorio)
+#   PROD_HEALTHCHECK_URL               URL completa de /api/agent-message?code=...
+#                                      de producción (opcional; si existe, se usa
+#                                      para confirmar que las funciones indexaron)
+
+name: Verificar y desplegar a producción
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+env:
+  AZURE_FUNCTIONAPP_NAME: whatsappbot-func
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  verificar:
+    name: El código importa (como lo indexaría Azure)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Dependencias del sistema (pyodbc)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq unixodbc-dev
+
+      - name: Instalar requirements.txt
+        run: pip install -r requirements.txt
+
+      - name: Importar function_app y listar funciones
+        run: |
+          python - <<'EOF'
+          import function_app, sys
+          fns = [f.get_function_name() for f in function_app.app.get_functions()]
+          print("Funciones registradas:", fns)
+          esperadas = {"whatsappbot1", "agent_message", "start_bot_mode", "new_lead_form"}
+          faltan = esperadas - set(fns)
+          if faltan:
+              print("❌ Faltan funciones:", faltan); sys.exit(1)
+          EOF
+
+  desplegar:
+    name: Desplegar a whatsappbot-func
+    needs: verificar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Desplegar (build remoto en Azure)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: .
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE }}
+          scm-do-build-during-deployment: true
+          enable-oryx-build: true
+          remote-build: true
+
+      - name: Comprobar que las funciones indexaron
+        if: ${{ secrets.PROD_HEALTHCHECK_URL != '' }}
+        env:
+          URL: ${{ secrets.PROD_HEALTHCHECK_URL }}
+        run: |
+          # agent-message con {} debe responder 400 (Invalid JSON / Missing wa_id).
+          # 404 = la Function App no indexó ninguna función (como el 10-sep-2026).
+          for i in 1 2 3 4 5 6; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -m 90 -X POST \
+              -H "Content-Type: application/json" -d '{}' "$URL")
+            echo "intento $i: HTTP $code"
+            if [ "$code" = "400" ]; then echo "✅ Producción responde"; exit 0; fi
+            sleep 20
+          done
+          echo "❌ Producción no responde 400 tras el despliegue (último código: $code)"
+          exit 1

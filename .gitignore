@@ -144,3 +144,5 @@ test_main_endpoint.py
 real_conversations_withLeads/
 
 update_invertory_db/prices.txt
+# Perfil de publicación de Azure (credenciales) — nunca al repo
+*.PublishSettings
