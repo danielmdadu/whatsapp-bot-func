@@ -7,12 +7,31 @@ from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError
 from maquinaria_config import machinery_config_service
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from typing import Optional
+
+ETIQUETAS_VALIDAS = {"valido", "competencia_prohibido", "fuera_de_dominio"}
 
 
-def clasificar_mensaje(message: str) -> str:
+def _build_user_content(message: str, last_bot_question: Optional[str]) -> str:
+    """Mensaje a clasificar, con la última pregunta del bot como contexto si la hay."""
+    if last_bot_question and last_bot_question.strip():
+        return (
+            f"Última pregunta del asistente: {last_bot_question.strip()}\n"
+            f"Mensaje del cliente: {message}"
+        )
+    return message
+
+
+def clasificar_mensaje(message: str, last_bot_question: Optional[str] = None) -> str:
     """
     Clasifica un mensaje en: valido, competencia_prohibido, fuera_de_dominio.
     Devuelve la etiqueta como string.
+
+    `last_bot_question` es la última pregunta que hizo el bot. Sin ella, un
+    mensaje como "Con Ángel de Mitra" (respuesta a "¿con quién tengo el
+    gusto?") o "No me han marcado" (queja por su cotización) parece fuera de
+    dominio: en la semana del 21-sep-2026 el clasificador aislado marcó 21
+    mensajes y solo 1 lo era.
     Se reutiliza el mismo deployment gpt-4.1-mini del bot principal (recurso Foundry
     'ai-model-bot' en prod / 'leadsbot-resource' en pruebas, vía FOUNDRY_ENDPOINT).
     Antes se usaba Ministral-3B, pero su deployment tenía RPM=1 y throttleaba (429)
@@ -54,7 +73,15 @@ def clasificar_mensaje(message: str) -> str:
             "   - Detalles sobre proyectos que requieren maquinaria\n"
             "   - Respuestas cortas sobre el giro o actividad de la empresa del cliente (ej: 'mantenimiento', 'construcción', 'minería', 'renta de maquinaria')\n"
             "   - Respuestas sobre si el equipo es para uso propio, venta o renta (ej: 'no, es para uso propio', 'sí, rentamos maquinaria')\n"
-            "   - Respuestas de selección cuando el usuario elige entre opciones presentadas (ej: 'la segunda', 'me interesa el primero', 'quiero la opción 3')\n\n"
+            "   - Respuestas de selección cuando el usuario elige entre opciones presentadas (ej: 'la segunda', 'me interesa el primero', 'quiero la opción 3')\n"
+            "   - CUALQUIER respuesta a la última pregunta del asistente, aunque por sí sola no mencione maquinaria (nombres, apellidos, nombres de empresas, ciudades, correos)\n"
+            "   - Seguimiento de su solicitud o cotización: cuándo lo contactan, por qué medio, cuánto tardan, si ya se la enviaron\n"
+            "   - Quejas o molestias sobre la atención, la espera o el asesor (ej: 'no me han marcado', 'llevo 3 días esperando', '¿no son una empresa seria?')\n"
+            "   - Confirmaciones sobre documentos que envió (ej: 'sí, es mi CSF', 'ya te la mandé')\n"
+            "   - Requisitos de uso del equipo (ej: 'que sea muy silencioso', 'para un cuarto frío', 'trabajo de 8 horas')\n"
+            "   - Refacciones, piezas o repuestos, y equipos que Alpha C no maneje (el asistente se encarga de responder que no los maneja)\n"
+            "   - Referencias a imágenes o archivos que el cliente envió (ej: 'con las características de la imagen')\n"
+            "   - Cortesías y saludos (ej: 'gracias', 'buen día', 'quedo pendiente')\n\n"
             
             "2. COMPETENCIA_PROHIBIDO - Consultas sobre otros proveedores:\n"
             "   - Preguntas sobre precios de competidores\n"
@@ -62,11 +89,14 @@ def clasificar_mensaje(message: str) -> str:
             "   - Recomendaciones de proveedores externos\n"
             "   - Consultas sobre alternativas a Alpha C\n\n"
             
-            "3. FUERA_DE_DOMINIO - Cualquier tema no relacionado con maquinaria:\n"
+            "3. FUERA_DE_DOMINIO - Temas que NO tienen relación con comprar maquinaria a Alpha C ni con la conversación en curso:\n"
             "   - Historia, ciencia general\n"
             "   - Entretenimiento, deportes, cultura\n"
             "   - Tecnología no relacionada con maquinaria\n"
-            "   - Política, religión, temas controversiales\n\n"
+            "   - Política, religión, temas controversiales\n"
+            "   - Solicitudes a otras áreas de la empresa (ej: empleo, recursos humanos, proveedores que quieren vender a Alpha C)\n\n"
+            "REGLA DE CONTEXTO: si se incluye la última pregunta del asistente y el mensaje la responde o sigue esa conversación, clasifícalo como valido. "
+            "Ante la duda, clasifica como valido: marcar mal un mensaje válido daña la conversación con un cliente real.\n\n"
             
             "EJEMPLOS IMPORTANTES:\n"
             "- '¿Cuál es el precio de la soldadora Shindaiwa?' → valido\n"
@@ -93,6 +123,18 @@ def clasificar_mensaje(message: str) -> str:
             "- 'por ahora solo eso' → valido (respuesta indicando que no requiere más maquinaria)\n"
             "- 'uso propio' → valido (respuesta sobre tipo de uso)\n"
             "- 'cliente_final' → valido (respuesta sobre tipo de cliente)\n"
+            "- Pregunta: '¿Con quién tengo el gusto?' / Mensaje: 'Con Ángel de Mitra' → valido (responde su nombre)\n"
+            "- Pregunta: '¿Cuál es el nombre de tu empresa?' / Mensaje: 'Larroc tucking' → valido (nombre de empresa)\n"
+            "- 'No me han marcado' → valido (seguimiento de su solicitud)\n"
+            "- 'Llevo 3 días esperando' → valido (queja por la atención)\n"
+            "- '¿No tienen suficientes asesores?' → valido (queja por la atención)\n"
+            "- '¿A qué hora me contactan?' → valido (seguimiento de su solicitud)\n"
+            "- 'Sí, es mi CSF' → valido (confirma un documento)\n"
+            "- 'Nota: muy silencioso' → valido (requisito del equipo)\n"
+            "- 'Me están solicitando estas piezas' → valido (refacciones)\n"
+            "- 'Son lanzadoras de concreto' → valido (equipo que busca, aunque no se maneje)\n"
+            "- 'Con las características de la imagen' → valido (referencia a un archivo que envió)\n"
+            "- 'Me puedes compartir el correo de recursos humanos' → fuera_de_dominio\n"
             "- '¿Cuál es la capital de México?' → fuera_de_dominio\n"
             "- 'Dame precios de otros proveedores' → competencia_prohibido\n\n"
             
@@ -110,7 +152,7 @@ def clasificar_mensaje(message: str) -> str:
                 response = client.complete(
                     messages=[
                         SystemMessage(content=system_prompt),
-                        UserMessage(content=message),
+                        UserMessage(content=_build_user_content(message, last_bot_question)),
                     ],
                     model=model_name,
                     temperature=0,
@@ -153,7 +195,10 @@ def clasificar_mensaje(message: str) -> str:
                 raw_output = raw_output[:json_end]
 
         result = json.loads(raw_output)
-        return result.get("label", "fuera_de_dominio")
+        label = str(result.get("label", "")).strip().lower()
+        # Fail-open: una etiqueta ausente o desconocida NO debe vetar al lead,
+        # igual que un error o un timeout del clasificador.
+        return label if label in ETIQUETAS_VALIDAS else "valido"
 
     try:
         # Usar ThreadPoolExecutor con timeout para Azure Functions

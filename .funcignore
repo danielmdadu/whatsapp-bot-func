@@ -33,3 +33,8 @@ test_results
 flujo_conversacion.puml
 
 real_conversations_withLeads/
+# Credenciales de despliegue y herramientas locales
+*.PublishSettings
+
+# Cualquier archivo de pruebas
+test_*.py

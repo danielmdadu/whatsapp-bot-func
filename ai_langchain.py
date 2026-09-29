@@ -2,7 +2,7 @@ import json
 import re
 import os
 import unicodedata
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 from langchain_openai import AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
@@ -676,6 +676,126 @@ def _build_catalog_response(next_question: Optional[str] = None) -> str:
     return response
 
 
+NEGATIVE_SENTINELS = ("No tiene", "No especificado")
+
+# Textos que el bot mismo genera cuando llega un archivo sin texto
+# (WhatsAppBot.process_multimedia_msg). No son respuestas del lead.
+_SIMULATED_ATTACHMENT_PREFIXES = ("[Archivo ", "Aquí está el archivo PDF adjunto.")
+
+
+def _is_simulated_attachment_text(message: Optional[str]) -> bool:
+    return bool(message) and message.strip().startswith(_SIMULATED_ATTACHMENT_PREFIXES)
+
+
+def lead_display_name(nombre: Any) -> str:
+    """
+    Nombre del lead apto para dirigirse a él, o "" si no hay uno real.
+
+    Los centinelas "No tiene"/"No especificado" llenan el slot para que el bot
+    no vuelva a preguntar, pero nunca deben aparecer en un saludo: en sept-2026
+    el bot escribió "Gracias, No tiene." y una plantilla salió como
+    "Hola No tiene, intentamos comunicarnos contigo…".
+    """
+    if not isinstance(nombre, str):
+        return ""
+    nombre = nombre.strip()
+    if not nombre or nombre in NEGATIVE_SENTINELS:
+        return ""
+    return nombre
+
+
+_GENERIC_MACHINE_WORDS = {
+    "la", "el", "los", "las", "de", "del", "para", "con", "una", "un", "que", "esa", "ese", "esta", "este",
+    "quiero", "modelo", "maquina", "equipo", "opcion", "marca", "tipo", "cotizar", "cotizacion",
+    "soldadora", "compresor", "generador", "planta", "torre", "iluminacion", "plataforma", "montacargas",
+    "manipulador", "rompedor", "martillo", "apisonador", "bailarina", "motobomba", "bomba",
+    "cortadora", "dobladora", "varilla", "electrica", "gasolina", "diesel",
+}
+
+
+def _machine_tokens(text: str) -> Set[str]:
+    normalized = unicodedata.normalize("NFKD", text.lower())
+    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
+    return {t for t in re.findall(r"[a-z0-9]+", normalized) if len(t) >= 2 and t not in _GENERIC_MACHINE_WORDS}
+
+
+def _brand_tokens(modelos: List[str]) -> Set[str]:
+    """Marcas del inventario: la primera palabra de cada modelo ("Shindaiwa EGW185MS")."""
+    return {t for m in modelos for t in list(_machine_tokens(m.split()[0]))[:1] if m.split()}
+
+
+def _looks_like_model_code(text: str, modelos: List[str]) -> bool:
+    """
+    True si el texto trae algo más que marca y palabras genéricas: un código
+    ("EGW185", "X-START", "400"). "shindaiwa" o "soldadora shindaiwa" → False.
+    """
+    return bool(_machine_tokens(text) - _brand_tokens(modelos))
+
+
+def _best_token_match(text: str, candidates: List[str]) -> Optional[str]:
+    """
+    Candidato que comparte más palabras distintivas (marca, código) con `text`,
+    solo si es el ÚNICO con el puntaje máximo. "soldadora shindaiwa" →
+    "Shindaiwa EGW185MS" si es la única Shindaiwa entre las candidatas.
+    """
+    wanted = _machine_tokens(text)
+    if not wanted:
+        return None
+    scored = []
+    for candidate in candidates:
+        tokens = _machine_tokens(candidate)
+        score = sum(
+            1 for w in wanted
+            if w in tokens or (len(w) >= 3 and any(
+                # Los números de código cuentan aunque estén dentro del modelo
+                # ("400" → "dgw400dmk"); las palabras, solo como prefijo.
+                (w in t) if any(ch.isdigit() for ch in w) else t.startswith(w)
+                for t in tokens
+            ))
+        )
+        scored.append((score, candidate))
+    if not scored:
+        return None
+    best = max(score for score, _ in scored)
+    winners = [c for score, c in scored if score == best]
+    return winners[0] if best > 0 and len(winners) == 1 else None
+
+
+def build_machine_selection_question(recomendadas: List[str]) -> str:
+    machines_list = "".join(f"{i}. {modelo}\n" for i, modelo in enumerate(recomendadas, 1))
+    return f"Perfecto, estas son las opciones disponibles:\n{machines_list}\n¿Cuál de estas opciones te interesa?"
+
+
+def _vocativo(current_state: Dict[str, Any]) -> str:
+    """", <nombre>" para intercalar en un mensaje, o "" si no hay nombre real."""
+    nombre = lead_display_name(current_state.get("nombre"))
+    return f", {nombre}" if nombre else ""
+
+
+def build_guardrail_instruction(guardrail_flag: Optional[str]) -> str:
+    """
+    Aviso del guardrail para el prompt de respuesta. Es solo una sugerencia:
+    el clasificador se equivoca con nombres, empresas y quejas, así que el LLM,
+    que ve la conversación completa, decide si aplica.
+    """
+    if guardrail_flag == "invalid_conversation":
+        return (
+            "AVISO DEL FILTRO DE CONTENIDO: el último mensaje del usuario podría no estar relacionado con "
+            "maquinaria. Si de verdad no tiene relación con su solicitud (por ejemplo, empleo, recursos humanos "
+            "u otros temas), dile con amabilidad que por este medio solo atiendes temas de maquinaria de "
+            "Alpha C y retoma la pregunta pendiente. Si SÍ tiene que ver con la conversación (su nombre, su "
+            "empresa, su cotización, un documento, una queja por la atención o la espera), IGNORA este aviso "
+            "y responde con normalidad; NUNCA le pidas que se centre en maquinaria en ese caso."
+        )
+    if guardrail_flag == "content_safety":
+        return (
+            "AVISO DEL FILTRO DE CONTENIDO: el último mensaje del usuario podría contener lenguaje "
+            "inapropiado. Responde con cortesía y profesionalismo, sin repetir ese lenguaje, y retoma la "
+            "conversación sobre maquinaria."
+        )
+    return ""
+
+
 def _sanitize_extracted_info(
     extracted_info: Dict[str, Any],
     message: Optional[str] = None,
@@ -684,6 +804,17 @@ def _sanitize_extracted_info(
 ) -> Dict[str, Any]:
     """Elimina valores inválidos antes de persistirlos en estado o CRM."""
     sanitized = dict(extracted_info)
+
+    # Un archivo sin texto no es una respuesta negativa a nada: la imagen que
+    # llega cuando el bot pregunta el nombre no significa "no tengo nombre".
+    if _is_simulated_attachment_text(message):
+        for key in [k for k, v in sanitized.items() if v in NEGATIVE_SENTINELS]:
+            logging.info("Descartado %s=%r: el mensaje es un archivo adjunto, no una respuesta.", key, sanitized[key])
+            sanitized.pop(key)
+
+    # Nadie "no tiene" nombre: si el lead no lo quiere dar, es "No especificado".
+    if sanitized.get("nombre") == "No tiene":
+        sanitized["nombre"] = "No especificado"
     if (
         sanitized.get("tipo_cliente") == "No tiene"
         and last_bot_question
@@ -979,8 +1110,12 @@ class IntelligentSlotFiller:
         Incluye el contexto de la última pregunta del bot para mejor interpretación
         """
         
-        # PRIMERO: Detectar si es una respuesta negativa o de incertidumbre
-        negative_response = self.detect_negative_response(message, last_bot_question)
+        # PRIMERO: Detectar si es una respuesta negativa o de incertidumbre.
+        # Un archivo sin texto no es una respuesta: no se evalúa (ver
+        # _is_simulated_attachment_text).
+        negative_response = None
+        if not _is_simulated_attachment_text(message):
+            negative_response = self.detect_negative_response(message, last_bot_question)
         
         extracted_data = {}
 
@@ -1175,11 +1310,8 @@ class IntelligentSlotFiller:
             recomendadas = current_state.get("maquinas_recomendadas", [])
             maquina_seleccionada = current_state.get("maquina_seleccionada")
             if quiere_cotizacion is True and len(recomendadas) > 1 and not maquina_seleccionada:
-                machines_list = ""
-                for i, modelo in enumerate(recomendadas, 1):
-                    machines_list += f"{i}. {modelo}\n"
                 return {
-                    "question": f"Perfecto, estas son las opciones disponibles:\n{machines_list}\n¿Cuál de estas opciones te interesa?",
+                    "question": build_machine_selection_question(recomendadas),
                     "reason": "El usuario no especificó cuál máquina desea cotizar",
                     "question_type": "seleccion_maquina"
                 }
@@ -1383,7 +1515,8 @@ class IntelligentResponseGenerator:
         is_inventory_question: bool = False,
         question_type: str = None,
         machine_reference: Optional[MachineReference] = None,
-        coverage: Optional[CoverageStatus] = None
+        coverage: Optional[CoverageStatus] = None,
+        guardrail_flag: Optional[str] = None
     ) -> str:
         """Genera una respuesta contextual apropiada usando un enfoque conversacional"""
         
@@ -1423,8 +1556,8 @@ class IntelligentResponseGenerator:
                         safe_info[key] = value
                 extracted_info_str = json.dumps(safe_info, ensure_ascii=False, indent=2)
 
-                if extracted_info.get("nombre"):
-                    nombre = extracted_info.get("nombre")
+                if lead_display_name(extracted_info.get("nombre")):
+                    nombre = lead_display_name(extracted_info.get("nombre"))
                     if is_initial_conversation:
                         extracted_name_instruction = f"El usuario ya proporcionó su nombre ({nombre}). Úsalo amablemente en tu saludo, PERO NO dejes de presentarte tú primero."
                     else:
@@ -1464,6 +1597,10 @@ class IntelligentResponseGenerator:
                 )
             else:
                 inventory_instruction = "Sigue las instrucciones dadas."
+
+            guardrail_instruction = build_guardrail_instruction(guardrail_flag)
+            if guardrail_instruction:
+                inventory_instruction = f"{inventory_instruction}\n{guardrail_instruction}"
 
             # Instrucción especial para cuando se pregunta sobre cotización de maquinarias
             if question_type == "quiere_cotizacion":
@@ -1837,13 +1974,19 @@ class IntelligentResponseGenerator:
         
         # Compresores estacionarios: siempre handoff a asesor especializado
         if _is_compresor_estacionario(current_state):
-            return f"Gracias por tu información, {current_state.get('nombre', 'Usuario')}. Un asesor especializado en compresores estacionarios se comunicará contigo para profundizar al respecto."
+            return f"Gracias por tu información{_vocativo(current_state)}. Un asesor especializado en compresores estacionarios se comunicará contigo para profundizar al respecto."
 
         from pricing_service import get_pricing_service
         
         # Fetch price for the selected machine only
         pricing_str = ""
         maquina_seleccionada = current_state.get("maquina_seleccionada")
+
+        # Sin máquina concreta no hay cotización que generar: prometer "Procederé
+        # a generar su cotización" dejaba al cliente esperando un PDF que nunca llega.
+        if not maquina_seleccionada:
+            logging.warning("[PRICING_DEBUG] generate_final_response: sin maquina_seleccionada; se deriva a un asesor.")
+            return self._no_price_handoff_message(current_state)
         
         logging.info(f"[PRICING_DEBUG] generate_final_response: maquina_seleccionada = '{maquina_seleccionada}'")
         
@@ -1872,7 +2015,7 @@ class IntelligentResponseGenerator:
                 # cotización sin precio: derivamos a un asesor.
                 return self._no_price_handoff_message(current_state)
         
-        return f"""¡Perfecto, {current_state.get('nombre', 'Usuario')}!{pricing_str}
+        return f"""¡Perfecto{_vocativo(current_state)}!{pricing_str}
 
 Procederé a generar su cotización."""
 
@@ -1882,9 +2025,8 @@ Procederé a generar su cotización."""
         En este caso NO se genera cotización ni se envía el PDF: un asesor
         contactará al cliente para darle la cotización.
         """
-        nombre = current_state.get("nombre", "Usuario")
         return (
-            f"Gracias por tu información, {nombre}. "
+            f"Gracias por tu información{_vocativo(current_state)}. "
             "Un asesor se pondrá en contacto contigo para brindarte la cotización."
         )
 
@@ -1934,6 +2076,10 @@ class IntelligentLeadQualificationChatbot:
         self._machine_ref: Optional[MachineReference] = None
         self._model_lookup_status: Optional[str] = None
         self._coverage: Optional[CoverageStatus] = None
+        # Aviso del guardrail de seguridad para el mensaje en curso (ver
+        # build_guardrail_instruction). Solo influye en la redacción de la
+        # respuesta; nunca en la extracción de datos.
+        self._guardrail_flag: Optional[str] = None
 
     def _create_empty_state(self) -> ConversationState:
         """Crea un estado vacío"""
@@ -1941,6 +2087,7 @@ class IntelligentLeadQualificationChatbot:
             # Campos que no se preguntan al usuario
             "completed": False,
             "cotizacion_enviada": False,  # True cuando ya se envió la respuesta final (evita ciclo)
+            "pdf_enviado": False,  # True SOLO si el PDF de cotización se envió con éxito
             "cierre_ofrecido": False,  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
             "sin_coincidencias_contexto": None,
             "derivacion_asesor_confirmada": False,
@@ -2026,7 +2173,7 @@ class IntelligentLeadQualificationChatbot:
         else:
             return "Gracias por la información. Pronto te contactará nuestro asesor especializado."
     
-    def send_message(self, user_message: str, whatsapp_message_id: str = None, odoo_manager: OdooManager = None) -> str:
+    def send_message(self, user_message: str, whatsapp_message_id: str = None, odoo_manager: OdooManager = None, guardrail_flag: Optional[str] = None) -> str:
         """
         Procesa un mensaje del usuario con slot-filling inteligente.
         Si odoo_manager es None, no se actualiza el lead en Odoo (para poder usar
@@ -2043,16 +2190,21 @@ class IntelligentLeadQualificationChatbot:
             
             # Mensaje que se regresa
             contextual_response = ""
+
+            self._guardrail_flag = guardrail_flag
             
             # Agregar mensaje del usuario
-            self.state["messages"].append({
+            user_entry = {
                 "role": "user", 
                 "whatsapp_message_id": whatsapp_message_id,
                 "content": user_message,
                 "question_type": "",
                 "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "sender": "lead"
-            })
+            }
+            if guardrail_flag:
+                user_entry["guardrail"] = guardrail_flag
+            self.state["messages"].append(user_entry)
 
             # Extraer TODA la información disponible del mensaje (SIEMPRE)
             # Obtener la última pregunta del bot para contexto
@@ -2189,6 +2341,7 @@ class IntelligentLeadQualificationChatbot:
         self.state["tipo_ayuda"] = "maquinaria"
         self.state["completed"] = False
         self.state["cotizacion_enviada"] = False
+        self.state["pdf_enviado"] = False
         self.state["cierre_ofrecido"] = False
 
     def _es_solicitud_de_refacciones(self, extracted_info: Dict[str, Any]) -> bool:
@@ -2391,6 +2544,7 @@ class IntelligentLeadQualificationChatbot:
             self.state["modelo_verificado_inventario"] = False
             self.state["completed"] = False
             self.state["cotizacion_enviada"] = False
+            self.state["pdf_enviado"] = False
 
     def _evaluate_lead_coverage(self) -> CoverageStatus:
         """
@@ -2472,7 +2626,8 @@ class IntelligentLeadQualificationChatbot:
                 next_question=None,
                 is_inventory_question=False,
                 question_type="conversation_complete",
-                coverage=self._coverage
+                coverage=self._coverage,
+                guardrail_flag=self._guardrail_flag
             )
             return self._add_message_and_return_response(generated_response, "")
 
@@ -2520,6 +2675,7 @@ class IntelligentLeadQualificationChatbot:
                 question_type="post_cierre",
                 machine_reference=self._machine_ref,
                 coverage=self._coverage,
+                guardrail_flag=self._guardrail_flag,
             )
             return self._add_message_and_return_response(generated_response, "")
 
@@ -2561,12 +2717,25 @@ class IntelligentLeadQualificationChatbot:
                 self.state["cotizacion_enviada"] = True  # Marcar que la respuesta final ya fue enviada
                 return self._add_message_and_return_response(final_response, storage_question_type)
 
+            # La máquina a cotizar debe ser un modelo exacto del inventario. Si
+            # hay varias recomendadas y no se sabe cuál, se pregunta en vez de
+            # cerrar sin cotización (ver _resolve_selected_machine).
+            self._resolve_selected_machine(final=True)
+            if self._needs_machine_selection():
+                self.state["completed"] = False
+                return self._add_message_and_return_response(
+                    build_machine_selection_question(self.state.get("maquinas_recomendadas", [])),
+                    "seleccion_maquina",
+                )
+
             final_response = self.response_generator.generate_final_response(self.state)
             self.state["cotizacion_enviada"] = True  # Marcar que la respuesta final ya fue enviada
             result = self._add_message_and_return_response(final_response, storage_question_type)
 
-            # Generate and send PDF quotation if applicable
-            self._try_send_pdf_quotation()
+            # Generate and send PDF quotation if applicable. pdf_enviado se
+            # persiste aparte: el estado ya se guardó al enviar el mensaje final.
+            if self._try_send_pdf_quotation():
+                self.save_conversation()
 
             # Send ficha técnica (technical datasheet) if available
             self._try_send_ficha_tecnica()
@@ -2628,7 +2797,8 @@ class IntelligentLeadQualificationChatbot:
             is_inventory_question=is_inventory_question,
             question_type=next_question_type,
             machine_reference=self._machine_ref,
-            coverage=self._coverage
+            coverage=self._coverage,
+            guardrail_flag=self._guardrail_flag
         )
 
         return self._add_message_and_return_response(generated_response, storage_question_type)
@@ -2750,6 +2920,7 @@ class IntelligentLeadQualificationChatbot:
             
             if result:
                 logging.info(f"[PDF] PDF quotation sent successfully. WhatsApp message_id: {result}")
+                self.state["pdf_enviado"] = True
                 return True
             else:
                 logging.error(f"[PDF] send_pdf_callback returned None/empty for {self.current_user_id}")
@@ -2905,6 +3076,7 @@ class IntelligentLeadQualificationChatbot:
                 self.state["modelo_verificado_inventario"] = False
                 self.state["completed"] = False
                 self.state["cotizacion_enviada"] = False
+                self.state["pdf_enviado"] = False
                 # La conversación se reabre: el cierre vuelve a estar disponible
                 # para cuando este nuevo requerimiento termine.
                 self.state["cierre_ofrecido"] = False
@@ -3211,37 +3383,102 @@ class IntelligentLeadQualificationChatbot:
             self.state["tipo_cliente"] = "cliente_final"
             debug_print(f"DEBUG: Reclasificado de distribuidor a cliente_final. Giro '{self.state.get('giro_empresa')}' no es de distribución y no tiene constancia fiscal.")
         
-        # Resolve partial model names against recommended machines
-        # e.g. "X-START" → "Trime X-START", "DGM250MK-D" → "Shindaiwa DGM250MK-D"
+        # maquina_seleccionada debe ser SIEMPRE un modelo exacto del inventario
+        # (ver _resolve_selected_machine).
+        self._resolve_selected_machine()
+
+    def _needs_machine_selection(self) -> bool:
+        """El cliente final quiere cotizar, hay varias opciones y no se sabe cuál."""
+        return (
+            self.state.get("tipo_cliente") != "distribuidor"
+            and self.state.get("quiere_cotizacion") is True
+            and not self.state.get("maquina_seleccionada")
+            and len(self.state.get("maquinas_recomendadas") or []) > 1
+        )
+
+    def _resolve_selected_machine(self, final: bool = False) -> None:
+        """
+        Convierte `maquina_seleccionada` en un modelo EXACTO del inventario, o la
+        borra si no se puede, para que el bot pregunte cuál quiere.
+
+        Nunca debe llegar al cierre un texto libre: el lead de 52…4088
+        (sept-2026) escribió "soldadora shindaiwa", ese texto quedó como máquina
+        seleccionada, no tenía precio y el cliente final se quedó sin su PDF
+        aunque la Shindaiwa EGW185MS sí tiene precio.
+
+        Orden: modelo exacto → contenido en una recomendada ("X-START") →
+        contenido en un modelo del inventario del tipo actual ("340") →
+        coincidencia de palabras con las recomendadas (marca/código) → única
+        recomendada → borrar.
+
+        Un código parcial ("EGW185") se conserva mientras aún no hay
+        recomendaciones, para resolverlo después; una marca o descripción se
+        borra de inmediato. Con recomendaciones o con `final=True` (justo antes
+        del cierre) lo que no se resuelve se borra.
+        """
         maquina_sel = self.state.get("maquina_seleccionada")
-        maquinas_recomendadas = self.state.get("maquinas_recomendadas", [])
-        if maquina_sel:
-            partial_lower = maquina_sel.lower().strip()
-            resolved = False
-            
-            # 1. Intentar resolver contra las máquinas recomendadas
-            if maquinas_recomendadas:
-                for full_model in maquinas_recomendadas:
-                    full_model_lower = full_model.lower().strip()
-                    if (partial_lower in full_model_lower or full_model_lower in partial_lower) and partial_lower != full_model_lower:
-                        debug_print(f"DEBUG: maquina_seleccionada resolved (recomendadas): '{maquina_sel}' → '{full_model}'")
-                        self.state["maquina_seleccionada"] = full_model
-                        resolved = True
-                        break
-            
-            # 2. Si no se encontró en recomendadas, buscar en todo el inventario local
-            #    para el tipo de maquinaria actual (ej: "340" → "Shindaiwa DGW340DM")
-            if not resolved:
-                from update_invertory_db.inventory_data import inventario
-                tipo = self.state.get("tipo_maquinaria")
-                for machine in inventario:
-                    if machine.get("categoria") == tipo:
-                        full_model = machine.get("modelo", "")
-                        if partial_lower in full_model.lower() and partial_lower != full_model.lower():
-                            debug_print(f"DEBUG: maquina_seleccionada resolved (inventario): '{maquina_sel}' → '{full_model}'")
-                            self.state["maquina_seleccionada"] = full_model
-                            break
-        
+        if not maquina_sel or not isinstance(maquina_sel, str):
+            return
+        maquinas_recomendadas = [m for m in (self.state.get("maquinas_recomendadas") or []) if isinstance(m, str)]
+        partial_lower = maquina_sel.lower().strip()
+
+        from update_invertory_db.inventory_data import inventario
+        modelos_inventario = [m.get("modelo", "") for m in inventario if m.get("modelo")]
+
+        def _set(model: str, how: str) -> None:
+            if model != maquina_sel:
+                debug_print(f"DEBUG: maquina_seleccionada resolved ({how}): '{maquina_sel}' → '{model}'")
+            self.state["maquina_seleccionada"] = model
+
+        # 1. Ya es un modelo exacto (se normaliza a la forma del inventario).
+        for full_model in maquinas_recomendadas + modelos_inventario:
+            if full_model.lower().strip() == partial_lower:
+                _set(full_model, "exacto")
+                return
+
+        # Una marca sola ("shindaiwa") o una descripción ("soldadora
+        # shindaiwa") NO es elegir un modelo: buscarla como subcadena elegía
+        # la primera Shindaiwa del inventario (DGW500DM) antes de preguntar
+        # siquiera el amperaje (prueba del 29-sep-2026).
+        es_codigo = _looks_like_model_code(maquina_sel, modelos_inventario)
+
+        if es_codigo:
+            # 2. Código parcial contenido en UNA sola recomendada.
+            hits = [m for m in maquinas_recomendadas
+                    if partial_lower in m.lower().strip() or m.lower().strip() in partial_lower]
+            if len(hits) == 1:
+                _set(hits[0], "recomendadas")
+                return
+
+            # 3. Código parcial contenido en UN solo modelo del tipo actual.
+            tipo = self.state.get("tipo_maquinaria")
+            hits = [m.get("modelo", "") for m in inventario
+                    if m.get("categoria") == tipo and m.get("modelo") and partial_lower in m["modelo"].lower()]
+            if len(hits) == 1:
+                _set(hits[0], "inventario")
+                return
+
+        # 4. Coincidencia de palabras (marca o código) con UNA sola recomendada.
+        match = _best_token_match(maquina_sel, maquinas_recomendadas)
+        if match:
+            _set(match, "palabras")
+            return
+
+        # 5. Si solo se recomendó una máquina, es la que se está cotizando.
+        if len(maquinas_recomendadas) == 1:
+            _set(maquinas_recomendadas[0], "única recomendada")
+            return
+
+        # 6. No se pudo resolver: mejor preguntar que cotizar un texto libre.
+        #    Un código parcial se conserva hasta que haya recomendaciones.
+        if es_codigo and not maquinas_recomendadas and not final:
+            return
+        logging.warning(
+            "Descartada maquina_seleccionada %r: no corresponde a ningún modelo del inventario "
+            "(recomendadas: %s).", maquina_sel, maquinas_recomendadas
+        )
+        self.state["maquina_seleccionada"] = None
+
     def _get_last_bot_question(self) -> Tuple[Optional[str], Optional[str]]:
         """Obtiene la última pregunta que hizo el bot para proporcionar contexto"""
         try:

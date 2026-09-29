@@ -30,6 +30,7 @@ class ConversationState(TypedDict):
     asignado_asesor: Optional[str]
     completed: bool
     cierre_ofrecido: bool  # True cuando ya se preguntó "¿hay algo más...?" (se pregunta una sola vez)
+    pdf_enviado: bool  # True SOLO cuando el PDF de cotización se envió con éxito (cotizacion_enviada = ya se mandó el mensaje final)
     sin_coincidencias_contexto: Optional[str]  # Requerimiento para el que ya se informó falta de inventario
     derivacion_asesor_confirmada: bool  # Evita repetir el mismo handoff en turnos posteriores
     recordatorios_derivacion_asesor: int  # Varía la respuesta si el lead insiste en el handoff
@@ -246,8 +247,15 @@ class CosmosDBStateStore(ConversationStateStore):
             self.container.upsert_item(cosmos_doc)
             # logging.info(f"Estado guardado con fallback completo para usuario {user_id}")
 
-    def add_single_message(self, user_id: str, message_content: Any, whatsapp_message_id: str, state: ConversationState) -> None:
-        """Agrega un mensaje único al estado de conversación"""
+    def add_single_message(self, user_id: str, message_content: Any, whatsapp_message_id: str, state: ConversationState, guardrail: Optional[str] = None) -> None:
+        """
+        Agrega un mensaje único al estado de conversación.
+
+        `guardrail` ("invalid_conversation" | "content_safety") marca que el
+        filtro de seguridad señaló el mensaje. Se guarda como campo aparte y el
+        texto del lead queda INTACTO; antes se reescribía con el prefijo
+        "(FD) MENSAJE INVÁLIDO…", que ensuciaba la plataforma y la extracción.
+        """
         try: 
             # Si es una nueva conversación, crear un nuevo documento
             if state.get("messages") == []:
@@ -268,6 +276,9 @@ class CosmosDBStateStore(ConversationStateStore):
                 new_message["content"] = message_content
             else:
                 new_message["multimedia"] = message_content
+
+            if guardrail:
+                new_message["guardrail"] = guardrail
 
             logging.info(f"Agregando mensaje del usuario {user_id}: {new_message}")
             
@@ -411,6 +422,7 @@ class CosmosDBStateStore(ConversationStateStore):
             # Sin esto el flag se perdía entre mensajes y el bot volvía a
             # preguntar "¿hay algo más...?" en cada turno (7.json).
             "cierre_ofrecido": state.get("cierre_ofrecido", False),
+            "pdf_enviado": state.get("pdf_enviado", False),
             "lugar_requerimiento": state.get("lugar_requerimiento"),
             "conversation_mode": cosmos_doc.get("conversation_mode", "bot"),
             "asignado_asesor": cosmos_doc.get("asignado_asesor"),
@@ -446,7 +458,7 @@ class CosmosDBStateStore(ConversationStateStore):
             "nombre", "apellido", "tipo_ayuda", "tipo_maquinaria", "detalles_maquinaria",
             "maquina_seleccionada", "maquinas_recomendadas", "tipo_cliente", "nombre_empresa", 
             "giro_empresa", "correo", "telefono", "completed", "cotizacion_enviada",
-            "cierre_ofrecido",
+            "cierre_ofrecido", "pdf_enviado",
             "lugar_requerimiento", "asignado_asesor", "quiere_cotizacion",
             "constancia_fiscal_entregada"
         ]
@@ -483,6 +495,8 @@ class CosmosDBStateStore(ConversationStateStore):
                 if msg.get("multimedia"):
                     msg_formatted["text"] = None
                     msg_formatted["multimedia"] = msg["multimedia"]
+                if msg.get("guardrail"):
+                    msg_formatted["guardrail"] = msg["guardrail"]
                 formatted_messages.append(msg_formatted)
             
             # Usar patch operation para agregar mensajes

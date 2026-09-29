@@ -297,6 +297,10 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
     {maquinas_recomendadas_str}
     
     REGLAS ESPECIALES PARA MAQUINA_SELECCIONADA:
+    - maquina_seleccionada SOLO puede ser un MODELO de máquina (marca + código, p. ej. "Shindaiwa EGW185MS"), NUNCA una descripción o categoría como "soldadora shindaiwa", "un generador" o "la de gasolina".
+    - Si hay máquinas recomendadas listadas arriba, el valor debe ser EXACTAMENTE uno de esos nombres, copiado tal cual.
+    - Si el usuario solo describe lo que busca (tipo, marca, características) sin elegir un modelo, NO extraigas maquina_seleccionada.
+    - Una MARCA sola (Shindaiwa, Koshin, Trime, LGMG, Simpedil, Airman, etc.) NO es un modelo. Ejemplo: "Quiero precio de la soldadora shindaiwa" → {{"tipo_maquinaria": "soldadora"}} (SIN maquina_seleccionada).
     - Si el usuario selecciona una máquina específica, extrae el MODELO EXACTO COMPLETO en maquina_seleccionada.
     - RESOLUCIÓN DE REFERENCIAS POSICIONALES (PRIORIDAD MÁXIMA):
       Si hay máquinas recomendadas listadas arriba y el usuario indica una posición (por número, ordinal, o expresión equivalente), DEBES resolver la posición al nombre COMPLETO del modelo correspondiente de la lista.
@@ -305,7 +309,7 @@ EXTRACTION_PROMPT = ChatPromptTemplate.from_template(
       * "la 3", "opción 3", "maquina 3", "la tercera", "quiero la 3" → modelo en posición 3
     - NUNCA extraigas solo el número o la referencia posicional (ej. "1", "primera"). SIEMPRE resuelve al nombre completo del modelo.
     - IMPORTANTE (ESTRICTO): Si el bot listó EXACTAMENTE UNA MÁQUINA y el usuario simplemente acepta ("esa opción", "la primera", "sí cotízame", "me interesa esa"), DEBES extraer el NOMBRE COMPLETO de esa máquina.
-    - Si el usuario menciona un nombre parcial de modelo (ej. "X-START"), extrae exactamente lo que dijo el usuario. La resolución al nombre completo se hará automáticamente.
+    - Si el usuario menciona un código de modelo parcial (ej. "X-START", "EGW185"), extrae exactamente ese código. La resolución al nombre completo se hará automáticamente.
     - IMPORTANTE: Cuando el usuario selecciona una máquina (ya sea por posición, nombre o aceptación genérica), TAMBIÉN debes extraer quiere_cotizacion: true.
     
     Respuesta (solo JSON):

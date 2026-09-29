@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import requests
-from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot
+from ai_langchain import AzureOpenAIConfig, IntelligentLeadQualificationChatbot, lead_display_name
 from state_management import ConversationStateStore
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
@@ -73,11 +73,19 @@ class WhatsAppBot:
             return "52" + phone_number[3:]
         return phone_number
 
+    def _template_lead_name(self) -> str:
+        """
+        Valor para el {{1}} de las plantillas ("Hola {{1}}, …"). Meta rechaza un
+        parámetro vacío, así que sin nombre real se usa "qué tal" ("Hola qué
+        tal, …") en lugar de centinelas como "No tiene".
+        """
+        return lead_display_name(self.chatbot.state.get("nombre")) or "qué tal"
+
     def get_template_text(self, template_name: str) -> str:
         """
         Obtiene el texto de una plantilla de WhatsApp.
         """
-        lead_name = self.chatbot.state.get("nombre", "") if self.chatbot.state.get("nombre") else ""
+        lead_name = self._template_lead_name()
         lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
 
         if template_name == "notificacion_de_leads":
@@ -92,7 +100,7 @@ class WhatsAppBot:
         Obtiene los componentes de una plantilla de WhatsApp.
         """
         self.chatbot.load_conversation(wa_id)
-        lead_name = self.chatbot.state.get("nombre", "") if self.chatbot.state.get("nombre") else ""
+        lead_name = self._template_lead_name()
         lead_machine_type = self.chatbot.state.get("tipo_maquinaria", "") if self.chatbot.state.get("tipo_maquinaria") else "nuestra maquinaria"
         logging.info(f"Nombre de lead: {lead_name}, Tipo de maquinaria: {lead_machine_type}")
         
@@ -319,11 +327,26 @@ class WhatsAppBot:
                 self.send_message(wa_id, status_response)
                 return
 
-            # Verificar si el mensaje es seguro
-            safety_result = self.guardrails.check_message_safety(message_text)
+            # Verificar si el mensaje es seguro. La última pregunta del bot le da
+            # contexto al clasificador de dominio: "Con Ángel de Mitra" es válido
+            # como respuesta a "¿con quién tengo el gusto?".
+            last_bot_question = None
+            try:
+                last_bot_question, _ = self.chatbot._get_last_bot_question()
+            except Exception as e:
+                logging.warning(f"No se pudo obtener la última pregunta del bot para el guardrail: {e}")
+
+            # Fuera de dominio / contenido inapropiado: el texto del lead NO se
+            # reescribe (antes se le anteponía "(FD) MENSAJE INVÁLIDO…", que se
+            # guardaba en Cosmos, confundía la extracción de datos y acababa en
+            # nombres como "No tiene"). El aviso viaja aparte, solo para redactar
+            # la respuesta, y se marca en el mensaje con el campo "guardrail".
+            guardrail_flag = None
+            safety_result = self.guardrails.check_message_safety(message_text, last_bot_question)
             if safety_result:
                 if safety_result["type"] == "invalid_conversation" or safety_result["type"] == "content_safety":
-                    message_text = "(FD) " + safety_result["message"] + " (FD) Mensaje del lead: " + message_text
+                    guardrail_flag = safety_result["type"]
+                    logging.info(f"Guardrail '{guardrail_flag}' para {wa_id}; el mensaje se procesa sin reescribir.")
                 else:
                     response_for_lead = "No me queda claro lo que dices. ¿Podrías explicarme mejor?"
                     # Enviar respuesta de seguridad por WhatsApp
@@ -339,10 +362,10 @@ class WhatsAppBot:
                     return
 
             # Guardamos el mensaje en la base de datos
-            self.state_store.add_single_message(wa_id, message_text, whatsapp_message_id, self.chatbot.state)
+            self.state_store.add_single_message(wa_id, message_text, whatsapp_message_id, self.chatbot.state, guardrail=guardrail_flag)
             
             # Procesar mensaje con LangChain (ahora envía automáticamente por WhatsApp)
-            self.chatbot.send_message(message_text, whatsapp_message_id, odoo_manager)
+            self.chatbot.send_message(message_text, whatsapp_message_id, odoo_manager, guardrail_flag=guardrail_flag)
                 
         except Exception as e:
             logging.error(f"Error procesando mensaje: {e}")

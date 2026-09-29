@@ -57,6 +57,7 @@ MODEL_CODE_MAPPING = {
     "LGMG CPD30": "CPD30",
     "Noblelift CPCD30": "CPCD30",
     "Noblelift FE4P25Q": "FE4P25Q",
+    "Noblelift CPQYD30": "CPQYD30",  # agregado 29-sep-2026
     
     # =========================================================================
     # MANIPULADOR (1)
@@ -72,9 +73,9 @@ MODEL_CODE_MAPPING = {
     "LGMG AR60JE-2": "AR60JE-2",
     "LGMG S2632E II": "S2632EII",
     "LGMG S2632EIILI": "S2632EIILI",
-    "LGMG S4046E II": "S4046EII",
+    "LGMG S4046E II": "S4046E-2",  # en SQL es S4046E-2 (corregido 29-sep-2026)
     "LGMG SS1230E": "SS1230E",
-    "LGMG S1932EII": "S1932EII",
+    "LGMG S1932EII": "S1932E-2",  # en SQL es S1932E-2 (corregido 29-sep-2026)
     "LGMG MP0607SE": "MP0607SE",
     "LGMG MP1007SE": "MP1007SE",
     "LGMG MP1208SE": "MP1208SE",
@@ -82,8 +83,10 @@ MODEL_CODE_MAPPING = {
     "LGMG S3246E II": "S3246E-2",
     
     # =========================================================================
-    # TORRE DE ILUMINACIÓN (0) - No tienen precio en SQL
+    # TORRE DE ILUMINACIÓN (1)
     # =========================================================================
+    "Trime X-START": "XSTART",  # agregado 29-sep-2026
+    # Pendiente de confirmar con Alpha C: "Shindaiwa SL433IDG-B/S1W" → ¿SL433IDGBS?
     
     # =========================================================================
     # CORTADORA DE VARILLAS (1)

@@ -1,3 +1,4 @@
+from typing import Optional
 import os
 import re
 from azure.ai.contentsafety import ContentSafetyClient
@@ -129,13 +130,14 @@ class ContentSafetyGuardrails:
             print("Error:", e)
             return None
 
-    def check_conversation_safety(self, message: str):
+    def check_conversation_safety(self, message: str, last_bot_question: Optional[str] = None):
         """
         Clasifica un mensaje en: valido, competencia_prohibido, fuera_de_dominio.
         Devuelve True si el mensaje no es valido, False si es valido, "timeout" si excede tiempo límite.
+        `last_bot_question` da contexto: una respuesta a la pregunta del bot es válida.
         """
         def _check_conversation():
-            clasificacion = clasificar_mensaje(message)
+            clasificacion = clasificar_mensaje(message, last_bot_question)
             return clasificacion != "valido"
 
         try:
@@ -153,7 +155,7 @@ class ContentSafetyGuardrails:
             # el mensaje (False = válido) en vez de bloquear a un lead legítimo.
             return False
 
-    def check_message_safety(self, message: str):  
+    def check_message_safety(self, message: str, last_bot_question: Optional[str] = None):
         logging.info(f"Verificando seguridad del mensaje: {message}")      
         # Verificar inyección de código (no requiere API externa, es rápido)
         detect_code_injection_result = self.detect_code_injection(message)
@@ -202,7 +204,7 @@ class ContentSafetyGuardrails:
                 }
             
             # Verificar seguridad de conversación
-            conversation_safety_result = self.check_conversation_safety(message)
+            conversation_safety_result = self.check_conversation_safety(message, last_bot_question)
             logging.info(f"Verificando seguridad de conversación: {conversation_safety_result}")
             if conversation_safety_result:
                 return {
